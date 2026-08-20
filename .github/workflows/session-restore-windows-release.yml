@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - session-restore
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -13,14 +17,19 @@ concurrency:
   group: session-restore-windows-preview
   cancel-in-progress: true
 
+env:
+  RELEASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
 jobs:
   build-windows:
     name: Build Windows x64
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout feature head
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -67,9 +76,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout feature head
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
 
       - name: Download Windows build
@@ -85,17 +95,17 @@ jobs:
         run: |
           set -euo pipefail
           TAG="session-restore-preview"
-          SHORT_SHA="${GITHUB_SHA::7}"
+          SHORT_SHA="${RELEASE_SHA::7}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f "$TAG" "$GITHUB_SHA"
+          git tag -f "$TAG" "$RELEASE_SHA"
           git push --force origin "refs/tags/$TAG"
 
           cat > release-notes.md <<EOF
           Windows x64 preview build of Rio with upstream PR #1704 session save/restore merged onto the fork's main baseline.
 
-          Commit: \`$GITHUB_SHA\`
+          Commit: \`$RELEASE_SHA\`
           Branch: \`session-restore\`
 
           This is an unsigned test build. Windows may show a SmartScreen warning.
@@ -113,7 +123,7 @@ jobs:
               --prerelease
           else
             gh release create "$TAG" \
-              --target "$GITHUB_SHA" \
+              --target "$RELEASE_SHA" \
               --title "Rio Session Restore Preview ($SHORT_SHA)" \
               --notes-file release-notes.md \
               --prerelease
