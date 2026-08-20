@@ -1,0 +1,71 @@
+name: Fix Windows SaveSession Binding
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-verify:
+    if: github.event.pull_request.head.ref == 'session-restore'
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: session-restore
+          fetch-depth: 0
+
+      - name: Add Windows Ctrl+Shift+S binding
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p = Path("frontends/rioterm/src/bindings/mod.rs")
+          text = p.read_text(encoding="utf-8")
+          marker = '''// Windows\n#[cfg(all(target_os = "windows", not(test)))]\npub fn platform_key_bindings('''
+          start = text.index(marker)
+          win = text[start:]
+          old = '''        "n", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::WindowCreateNew;\n        ",", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::ConfigEditor;\n'''
+          new = '''        "n", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::WindowCreateNew;\n        "s", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SaveSession;\n        ",", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::ConfigEditor;\n'''
+          if old not in win:
+              raise SystemExit("Windows binding insertion point not found")
+          win = win.replace(old, new, 1)
+          p.write_text(text[:start] + win, encoding="utf-8")
+          '@ | Set-Content -Encoding utf8 fix_binding.py
+          python fix_binding.py
+          cargo fmt --all
+
+      - name: Assert Windows SaveSession binding exists in Windows block
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          text = Path("frontends/rioterm/src/bindings/mod.rs").read_text(encoding="utf-8")
+          marker = '''// Windows\n#[cfg(all(target_os = "windows", not(test)))]\npub fn platform_key_bindings('''
+          start = text.index(marker)
+          block = text[start:]
+          expected = '''"s", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SaveSession;'''
+          assert expected in block, "Windows Ctrl+Shift+S SaveSession binding missing"
+          print("verified Windows Ctrl+Shift+S -> Action::SaveSession")
+          '@ | Set-Content -Encoding utf8 verify_binding.py
+          python verify_binding.py
+
+      - name: Re-run persistence tests
+        run: cargo test -p rioterm session_persistence_tests -- --nocapture
+
+      - name: Compile Windows Rio
+        run: cargo check -p rioterm
+
+      - name: Commit verified binding fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git add -- frontends/rioterm/src/bindings/mod.rs
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix(session): wire SaveSession shortcut on Windows"
+          git push origin HEAD:session-restore
