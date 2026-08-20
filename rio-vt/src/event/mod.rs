@@ -262,6 +262,18 @@ pub enum RioEvent {
     /// Quit request.
     Quit,
 
+    /// Save the current session to disk (tabs/splits/CWDs/scrollback).
+    SaveSession,
+
+    /// Hide the transient "session saved" notice.
+    ClearSessionNotice,
+
+    /// Save the session under a chosen name (palette "Save Session As").
+    SaveSessionAs(String),
+
+    /// Restore a named session into the current window (append tabs).
+    RestoreSessionByName(String),
+
     /// Leave current terminal.
     CloseTerminal(usize),
 
@@ -346,6 +358,10 @@ impl Debug for RioEvent {
             }
             RioEvent::Exit => write!(f, "Exit"),
             RioEvent::Quit => write!(f, "Quit"),
+            RioEvent::SaveSession => write!(f, "SaveSession"),
+            RioEvent::ClearSessionNotice => write!(f, "ClearSessionNotice"),
+            RioEvent::SaveSessionAs(_) => write!(f, "SaveSessionAs"),
+            RioEvent::RestoreSessionByName(_) => write!(f, "RestoreSessionByName"),
             RioEvent::CloseTerminal(route) => write!(f, "CloseTerminal {route}"),
             RioEvent::ChildExited(route, status) => {
                 write!(f, "ChildExited(route={route}, status={status:?})")
