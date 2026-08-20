@@ -21,9 +21,13 @@ env:
   RELEASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
 jobs:
-  build-windows:
-    name: Build Windows x64
-    runs-on: windows-latest
+  test-windows:
+    name: Test Windows persistence (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout feature head
@@ -35,9 +39,29 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target
+          key: session-persistence-${{ matrix.os }}
+
+      - name: Test session persistence
+        run: cargo test -p rioterm session_persistence_tests -- --nocapture
 
       - name: Verify session scrollback round trip
         run: cargo test -p rio-vt scrollback_ansi_round_trip
+
+  build-windows:
+    name: Build Windows x64
+    needs: test-windows
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout feature head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
 
       - name: Build Rio release binary
         run: cargo build --release -p rioterm
@@ -108,6 +132,7 @@ jobs:
           Commit: \`$RELEASE_SHA\`
           Branch: \`session-restore\`
 
+          Session persistence is regression-tested on GitHub Windows Server 2022 and 2025 before packaging.
           This is an unsigned test build. Windows may show a SmartScreen warning.
 
           Assets:
