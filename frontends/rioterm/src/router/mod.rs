@@ -159,7 +159,9 @@ impl Route<'_> {
                 self.request_overlay_redraw();
                 return;
             }
-            SessionRestore::Always => self.save_session(),
+            SessionRestore::Always => {
+                let _ = self.save_session();
+            }
             SessionRestore::Never => {}
         }
         std::process::exit(0);
@@ -178,7 +180,7 @@ impl Route<'_> {
     }
 
     /// Persist this window's tabs/splits/CWDs/scrollback to disk.
-    pub fn save_session(&mut self) {
+    pub fn save_session(&mut self) -> bool {
         let max = self.window.screen.renderer.session_max_scrollback;
         let state = crate::session::SessionState {
             version: crate::session::SESSION_VERSION,
@@ -188,19 +190,24 @@ impl Route<'_> {
                 &self.window.winit_window,
             )],
         };
-        if let Err(err) = state.save(&self.session_path()) {
-            tracing::warn!("session save failed: {err}");
+        let path = self.session_path();
+        match state.save(&path) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!("session save failed at {}: {err}", path.display());
+                false
+            }
         }
     }
 
     /// Palette "Save Session As": bind this window to `name` and save.
-    pub fn save_session_as(&mut self, name: &str) {
+    pub fn save_session_as(&mut self, name: &str) -> bool {
         let name = crate::session::sanitize_name(name);
         if name.is_empty() {
-            return;
+            return false;
         }
         self.session_name = Some(name);
-        self.save_session();
+        self.save_session()
     }
 
     /// Palette "Restore Session": append a named session's tabs to
@@ -565,8 +572,10 @@ impl Route<'_> {
                     (Key::Character(c), SessionPromptKind::SaveOnExit)
                         if c.as_str() == "y" || c.as_str() == "Y" =>
                     {
-                        self.save_session();
-                        std::process::exit(0);
+                        if self.save_session() {
+                            std::process::exit(0);
+                        }
+                        self.request_overlay_redraw();
                     }
                     (Key::Character(c), SessionPromptKind::SaveOnExit)
                         if c.as_str() == "n" || c.as_str() == "N" =>

@@ -214,15 +214,19 @@ pub fn config_dir_path() -> PathBuf {
 #[cfg(target_os = "windows")]
 #[inline]
 pub fn config_dir_path() -> PathBuf {
-    std::env::var("RIO_CONFIG_HOME")
+    if let Some(path) = std::env::var_os("RIO_CONFIG_HOME") {
+        return PathBuf::from(path);
+    }
+
+    std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .unwrap_or(
+        .unwrap_or_else(|| {
             dirs::home_dir()
-                .unwrap()
+                .expect("unable to determine Windows home directory")
                 .join("AppData")
                 .join("Local")
-                .join("rio"),
-        )
+        })
+        .join("rio")
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]

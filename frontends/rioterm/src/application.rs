@@ -644,44 +644,46 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
             RioEventType::Rio(RioEvent::SaveSession) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route.save_session();
-                    route
-                        .window
-                        .screen
-                        .renderer
-                        .session_prompt
-                        .set_saved_notice(true);
-                    route.request_redraw();
-                    self.scheduler.schedule(
-                        EventPayload::new(
-                            RioEventType::Rio(RioEvent::ClearSessionNotice),
-                            window_id,
-                        ),
-                        Duration::from_millis(1500),
-                        false,
-                        TimerId::new(Topic::ClearSessionNotice, 0),
-                    );
+                    if route.save_session() {
+                        route
+                            .window
+                            .screen
+                            .renderer
+                            .session_prompt
+                            .set_saved_notice(true);
+                        route.request_redraw();
+                        self.scheduler.schedule(
+                            EventPayload::new(
+                                RioEventType::Rio(RioEvent::ClearSessionNotice),
+                                window_id,
+                            ),
+                            Duration::from_millis(1500),
+                            false,
+                            TimerId::new(Topic::ClearSessionNotice, 0),
+                        );
+                    }
                 }
             }
             RioEventType::Rio(RioEvent::SaveSessionAs(name)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route.save_session_as(&name);
-                    route
-                        .window
-                        .screen
-                        .renderer
-                        .session_prompt
-                        .set_saved_notice(true);
-                    route.request_redraw();
-                    self.scheduler.schedule(
-                        EventPayload::new(
-                            RioEventType::Rio(RioEvent::ClearSessionNotice),
-                            window_id,
-                        ),
-                        Duration::from_millis(1500),
-                        false,
-                        TimerId::new(Topic::ClearSessionNotice, 0),
-                    );
+                    if route.save_session_as(&name) {
+                        route
+                            .window
+                            .screen
+                            .renderer
+                            .session_prompt
+                            .set_saved_notice(true);
+                        route.request_redraw();
+                        self.scheduler.schedule(
+                            EventPayload::new(
+                                RioEventType::Rio(RioEvent::ClearSessionNotice),
+                                window_id,
+                            ),
+                            Duration::from_millis(1500),
+                            false,
+                            TimerId::new(Topic::ClearSessionNotice, 0),
+                        );
+                    }
                 }
             }
             RioEventType::Rio(RioEvent::RestoreSessionByName(name)) => {

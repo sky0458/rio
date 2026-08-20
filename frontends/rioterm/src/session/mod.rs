@@ -80,6 +80,12 @@ impl SessionState {
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
         let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
         std::fs::write(path, bytes)
     }
@@ -262,5 +268,99 @@ fn restore_active_pane<T: EventListener + Clone + Send + 'static>(
     let mut counter = 0;
     if let Some(idx) = find_active_index(layout, &mut counter) {
         ctx_manager.select_pane_by_order(idx);
+    }
+}
+
+#[cfg(test)]
+mod session_persistence_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rio-session-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn sample_state() -> SessionState {
+        SessionState {
+            version: SESSION_VERSION,
+            windows: vec![WindowState {
+                tabs: vec![TabState {
+                    layout: LayoutNode::Leaf(PaneState {
+                        cwd: Some(r"C:\work\rio".to_string()),
+                        title: Some("shell".to_string()),
+                        is_active: true,
+                        scrollback: "hello\r\n".to_string(),
+                    }),
+                    custom_title: Some("dev".to_string()),
+                }],
+                active_tab: 0,
+                size: (1280, 720),
+                position: Some((20, 30)),
+            }],
+        }
+    }
+
+    #[test]
+    fn save_creates_missing_parent_directories_and_round_trips() {
+        let root = temp_root("create-parent");
+        let path = root.join("missing").join("rio").join("session.json");
+        assert!(!path.parent().unwrap().exists());
+        sample_state()
+            .save(&path)
+            .expect("session save must succeed");
+        assert!(path.is_file());
+
+        let loaded = SessionState::load(&path).expect("saved session must load");
+        assert_eq!(loaded.version, SESSION_VERSION);
+        assert_eq!(loaded.windows.len(), 1);
+        assert_eq!(loaded.windows[0].tabs.len(), 1);
+        assert_eq!(loaded.windows[0].size, (1280, 720));
+        assert_eq!(loaded.windows[0].position, Some((20, 30)));
+        match &loaded.windows[0].tabs[0].layout {
+            LayoutNode::Leaf(pane) => {
+                assert_eq!(pane.cwd.as_deref(), Some(r"C:\work\rio"));
+                assert!(pane.is_active);
+                assert_eq!(pane.scrollback, "hello\r\n");
+            }
+            LayoutNode::Split { .. } => panic!("expected leaf"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_overwrites_an_existing_session_file() {
+        let root = temp_root("overwrite");
+        let path = root.join("session.json");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&path, b"broken").unwrap();
+        sample_state().save(&path).expect("overwrite must succeed");
+        assert!(SessionState::load(&path).is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_unknown_session_version() {
+        let root = temp_root("version");
+        let path = root.join("session.json");
+        let mut state = sample_state();
+        state.version = SESSION_VERSION + 1;
+        state.save(&path).unwrap();
+        assert!(SessionState::load(&path).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_session_action_is_config_parseable() {
+        assert_eq!(
+            crate::bindings::Action::from("SaveSession".to_string()),
+            crate::bindings::Action::SaveSession
+        );
     }
 }
