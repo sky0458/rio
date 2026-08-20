@@ -1,0 +1,122 @@
+name: Session Restore Windows Preview
+
+on:
+  push:
+    branches:
+      - session-restore
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: session-restore-windows-preview
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Verify session scrollback round trip
+        run: cargo test -p rio-vt scrollback_ansi_round_trip
+
+      - name: Build Rio release binary
+        run: cargo build --release -p rioterm
+
+      - name: Package unsigned portable build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+
+          Copy-Item target/release/rio.exe package/rio.exe
+          Copy-Item LICENSE package/LICENSE
+          Copy-Item README.md package/README.md
+
+          Compress-Archive -Path package/* -DestinationPath dist/rio-session-restore-windows-x86_64.zip -Force
+          Copy-Item target/release/rio.exe dist/rio-session-restore-windows-x86_64.exe
+
+          $zipHash = (Get-FileHash dist/rio-session-restore-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          $exeHash = (Get-FileHash dist/rio-session-restore-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+          @(
+            "$zipHash  rio-session-restore-windows-x86_64.zip",
+            "$exeHash  rio-session-restore-windows-x86_64.exe"
+          ) | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rio-session-restore-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish rolling prerelease
+    needs: build-windows
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: rio-session-restore-windows-x86_64
+          path: dist
+
+      - name: Publish session-restore-preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="session-restore-preview"
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$TAG"
+
+          cat > release-notes.md <<EOF
+          Windows x64 preview build of Rio with upstream PR #1704 session save/restore merged onto the fork's main baseline.
+
+          Commit: \`$GITHUB_SHA\`
+          Branch: \`session-restore\`
+
+          This is an unsigned test build. Windows may show a SmartScreen warning.
+
+          Assets:
+          - \`rio-session-restore-windows-x86_64.zip\` — portable package
+          - \`rio-session-restore-windows-x86_64.exe\` — raw executable
+          - \`SHA256SUMS.txt\` — checksums
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "Rio Session Restore Preview ($SHORT_SHA)" \
+              --notes-file release-notes.md \
+              --prerelease
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Rio Session Restore Preview ($SHORT_SHA)" \
+              --notes-file release-notes.md \
+              --prerelease
+          fi
+
+          gh release upload "$TAG" dist/* --clobber
