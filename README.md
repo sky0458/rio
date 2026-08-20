@@ -21,6 +21,10 @@
 
 Documentation: [rioterm.com](https://rioterm.com).
 
+> **Windows Session V2 + current-pane CWD + Nushell build**  
+> Restores workspace windows, tabs/splits, per-pane CWD and optional scrollback; Windows split/new-tab CWD inheritance supports Nushell OSC 9;9.  
+> **[Download the Windows x64 release](https://github.com/sky0458/rio/releases/tag/windows-current-pane-cwd-preview)** · unsigned preview build for Windows 10 1809+ / Windows 11.
+
 ## Supporting the Project
 
 If you use and like Rio, please consider sponsoring it: your support helps to cover the fees required to maintain the project and to validate the time spent working on it!

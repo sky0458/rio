@@ -1,21 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy, Default)]
-pub enum SessionRestore {
-    #[serde(alias = "never")]
-    #[default]
-    Never,
-    #[serde(alias = "prompt")]
-    Prompt,
-    #[serde(alias = "always")]
-    Always,
-}
-
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 pub struct Session {
-    #[serde(default)]
-    pub restore: SessionRestore,
-    /// Upper bound of history+screen lines dumped per pane on save.
+    /// Upper bound of history+screen lines captured per pane on session save.
+    /// `0` disables scrollback capture and serialization completely.
     #[serde(
         default = "default_max_scrollback_lines",
         rename = "max-scrollback-lines"
@@ -30,8 +18,18 @@ fn default_max_scrollback_lines() -> usize {
 impl Default for Session {
     fn default() -> Session {
         Session {
-            restore: SessionRestore::default(),
             max_scrollback_lines: default_max_scrollback_lines(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_disables_scrollback_capture() {
+        let decoded: Session = toml::from_str("max-scrollback-lines = 0").unwrap();
+        assert_eq!(decoded.max_scrollback_lines, 0);
     }
 }

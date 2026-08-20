@@ -1154,10 +1154,15 @@ impl<U: Handler> Perform for Performer<'_, U> {
                     .set_hyperlink(osc::parse_hyperlink(params[1], params[2]));
             }
 
-            // OSC 9;4 progress; OSC 9 desktop notification fallback.
+            // OSC 9;9 current directory; OSC 9;4 progress; OSC 9 notification fallback.
             b"9" => {
-                if let Some(report) = osc::parse_progress_report(params) {
+                if let Some(path) = osc::parse_osc9_9_current_directory(params) {
+                    self.handler.set_current_directory(path.into());
+                } else if let Some(report) = osc::parse_progress_report(params) {
                     self.handler.set_progress_report(report);
+                } else if params.get(1) == Some(&b"9".as_slice()) {
+                    // A malformed cwd report must not surface as a desktop notification.
+                    unhandled(params);
                 } else if params.len() >= 2 {
                     let body = std::str::from_utf8(params[1])
                         .unwrap_or_default()

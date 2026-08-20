@@ -1,7 +1,6 @@
 pub mod routes;
 mod window;
 use crate::event::EventProxy;
-use crate::renderer::session_prompt::SessionPromptKind;
 use crate::router::window::{
     configure_window, create_window_builder, DEFAULT_MINIMUM_WINDOW_HEIGHT,
     DEFAULT_MINIMUM_WINDOW_WIDTH,
@@ -37,8 +36,6 @@ pub struct Route<'a> {
     pub assistant: assistant::Assistant,
     pub path: RoutePath,
     pub window: RouteWindow<'a>,
-    /// Parsed session waiting on the launch "resume?" answer.
-    pub pending_session: Option<crate::session::SessionState>,
     /// Named-session binding (`rio --session <name>`): saves and
     /// quit-prompts target `sessions/<name>.json` instead of the
     /// implicit last-session slot.
@@ -57,7 +54,6 @@ impl Route<'_> {
             assistant,
             path,
             window,
-            pending_session: None,
             session_name: None,
         }
     }
@@ -147,23 +143,6 @@ impl Route<'_> {
 
     #[inline]
     pub fn quit(&mut self) {
-        use rio_backend::config::session::SessionRestore;
-        match self.window.screen.renderer.session_restore {
-            SessionRestore::Prompt => {
-                self.window.screen.renderer.confirm_quit.set_active(false);
-                self.window
-                    .screen
-                    .renderer
-                    .session_prompt
-                    .set_active(Some(SessionPromptKind::SaveOnExit));
-                self.request_overlay_redraw();
-                return;
-            }
-            SessionRestore::Always => {
-                let _ = self.save_session();
-            }
-            SessionRestore::Never => {}
-        }
         std::process::exit(0);
     }
 
@@ -189,6 +168,7 @@ impl Route<'_> {
                 max,
                 &self.window.winit_window,
             )],
+            active_window: 0,
         };
         let path = self.session_path();
         match state.save(&path) {
@@ -210,71 +190,58 @@ impl Route<'_> {
         self.save_session()
     }
 
-    /// Palette "Restore Session": append a named session's tabs to
-    /// this window. Named sessions are workspaces — never consumed.
+    /// Palette "Restore Session": append the first window of a named workspace.
     pub fn restore_session_named(&mut self, name: &str) {
         let path = rio_backend::config::session_named_path(name);
         if let Some(state) = crate::session::SessionState::load(&path) {
             self.session_name = Some(name.to_string());
-            self.restore_session_inner(state, false);
+            if let Some(window) = state.windows.into_iter().next() {
+                if let Err(err) = self.restore_window_state(window, false) {
+                    tracing::warn!("named session restore failed: {err}");
+                }
+            }
         }
     }
 
-    /// Offer to resume `state` (activates the launch prompt).
-    pub fn prompt_session_resume(&mut self, state: crate::session::SessionState) {
-        self.pending_session = Some(state);
-        self.window
-            .screen
-            .renderer
-            .session_prompt
-            .set_active(Some(SessionPromptKind::ResumeOnLaunch));
-        self.request_overlay_redraw();
-    }
-
-    /// Rebuild tabs/splits/scrollback from a saved session, replacing
-    /// the window's default tab (launch-time restore).
     pub fn restore_session(&mut self, state: crate::session::SessionState) {
-        self.restore_session_inner(state, true);
+        if let Some(window) = state.windows.into_iter().next() {
+            if let Err(err) = self.restore_window_state(window, true) {
+                tracing::warn!("session restore failed: {err}");
+            }
+        }
     }
 
-    fn restore_session_inner(
+    /// Restore exactly one saved window. Each newly-created tab is transactional:
+    /// if one of its panes fails to spawn, that partial tab is removed and an error
+    /// is returned instead of mapping saved content onto an unrelated live pane.
+    pub fn restore_window_state(
         &mut self,
-        state: crate::session::SessionState,
+        win: crate::session::WindowState,
         replace: bool,
-    ) {
-        let Some(win) = state.windows.into_iter().next() else {
-            return;
-        };
+    ) -> Result<(), String> {
         if win.tabs.is_empty() {
-            return;
+            return Ok(());
         }
-        if replace && win.size.0 > 0 && win.size.1 > 0 {
-            // When the platform applies the size immediately (Wayland),
-            // no Resized event follows — run the resize pipeline here so
-            // the layout and the tabs built below use the final size.
-            if let Some(applied) = self
-                .window
-                .winit_window
-                .request_inner_size(PhysicalSize::new(win.size.0, win.size.1))
-            {
+        if replace && win.size.0 > 0.0 && win.size.1 > 0.0 {
+            let logical = rio_window::dpi::LogicalSize::new(win.size.0, win.size.1);
+            if let Some(applied) = self.window.winit_window.request_inner_size(logical) {
                 if applied.width > 0 && applied.height > 0 {
                     self.window.screen.resize(applied);
                 }
             }
         }
-        // No-op on Wayland: the compositor owns placement.
         if let (true, Some((x, y))) = (replace, win.position) {
             self.window
                 .winit_window
-                .set_outer_position(PhysicalPosition::new(x, y));
+                .set_outer_position(rio_window::dpi::LogicalPosition::new(x, y));
         }
+        if replace {
+            self.window.winit_window.set_maximized(win.maximized);
+        }
+
         let screen = &mut self.window.screen;
         for tab in &win.tabs {
             let first = tab.layout.first_leaf();
-
-            // Mirror Screen::create_tab: grow the top margin before the
-            // tab exists (hide_if_single -> visible transition) and
-            // reposition the previous tab's rich texts.
             let num_tabs = screen.ctx().len();
             let old_index = screen.context_manager.current_index();
             screen.resize_top_or_bottom_line(num_tabs + 1);
@@ -282,10 +249,13 @@ impl Route<'_> {
             screen.context_manager.contexts_mut()[old_index]
                 .update_dimensions(&mut screen.sugarloaf);
 
-            screen.ctx_mut().add_context_with_dir(
-                crate::context::next_rich_text_id(),
-                first.cwd.clone(),
-            );
+            if let Err(err) = screen
+                .ctx_mut()
+                .add_context_from_session(crate::context::next_rich_text_id(), first)
+            {
+                screen.resize_top_or_bottom_line(num_tabs);
+                return Err(format!("unable to create restored tab: {err}"));
+            }
             let new_index = screen.context_manager.current_index();
             screen.context_manager.switch_context_visibility(
                 &mut screen.sugarloaf,
@@ -293,15 +263,22 @@ impl Route<'_> {
                 new_index,
             );
             screen.ctx_mut().current_grid_mut().custom_title = tab.custom_title.clone();
-            crate::session::restore_tab_layout(
+            screen.ctx_mut().current_grid_mut().custom_color = tab.custom_color;
+
+            if let Err(err) = crate::session::restore_tab_layout(
                 &mut screen.context_manager,
-                &tab.layout,
+                tab,
                 &mut screen.sugarloaf,
-            );
+            ) {
+                screen
+                    .context_manager
+                    .close_current_context(&mut screen.sugarloaf);
+                screen.resize_top_or_bottom_line(num_tabs);
+                return Err(format!("unable to restore tab layout: {err}"));
+            }
         }
+
         if replace {
-            // Drop the default tab the window opened with; the restored
-            // tabs then sit at their saved indices.
             screen.ctx_mut().select_tab(0);
             screen
                 .context_manager
@@ -313,16 +290,8 @@ impl Route<'_> {
                 .select_tab(win.active_tab.min(win.tabs.len().saturating_sub(1)));
         }
         screen.resize_all_contexts();
-
-        // The implicit last-session slot is consumed once restored;
-        // quitting offers a fresh save, so a stale copy must not
-        // re-prompt next launch. Named sessions persist.
-        if replace && self.session_name.is_none() {
-            crate::session::SessionState::discard(
-                &rio_backend::config::session_file_path(),
-            );
-        }
         self.request_redraw();
+        Ok(())
     }
 
     #[inline]
@@ -566,54 +535,6 @@ impl Route<'_> {
             return true;
         }
 
-        if let Some(kind) = self.window.screen.renderer.session_prompt.kind() {
-            if key_event.state == rio_window::event::ElementState::Pressed {
-                match (&key_event.logical_key, kind) {
-                    (Key::Character(c), SessionPromptKind::SaveOnExit)
-                        if c.as_str() == "y" || c.as_str() == "Y" =>
-                    {
-                        if self.save_session() {
-                            std::process::exit(0);
-                        }
-                        self.request_overlay_redraw();
-                    }
-                    (Key::Character(c), SessionPromptKind::SaveOnExit)
-                        if c.as_str() == "n" || c.as_str() == "N" =>
-                    {
-                        std::process::exit(0);
-                    }
-                    (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
-                        if c.as_str() == "y" || c.as_str() == "Y" =>
-                    {
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        if let Some(state) = self.pending_session.take() {
-                            self.restore_session(state);
-                        }
-                        self.request_overlay_redraw();
-                    }
-                    (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
-                        if c.as_str() == "n" || c.as_str() == "N" =>
-                    {
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        self.pending_session = None;
-                        crate::session::SessionState::discard(
-                            &rio_backend::config::session_file_path(),
-                        );
-                        self.request_overlay_redraw();
-                    }
-                    // Esc cancels: on exit it aborts the quit, on
-                    // launch it keeps the file for next time.
-                    (Key::Named(NamedKey::Escape), _) => {
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        self.pending_session = None;
-                        self.request_overlay_redraw();
-                    }
-                    _ => {}
-                }
-            }
-            return true;
-        }
-
         if self.path == RoutePath::Terminal {
             return false;
         }
@@ -790,7 +711,7 @@ impl Router<'_> {
         config: &'a rio_backend::config::Config,
         open_url: Option<String>,
         app_id: Option<&str>,
-    ) {
+    ) -> WindowId {
         let tab_id = if config.navigation.is_native() {
             let id = self.current_tab_id;
             self.current_tab_id = self.current_tab_id.wrapping_add(1);
@@ -816,7 +737,6 @@ impl Router<'_> {
             window,
             path: RoutePath::Terminal,
             assistant: Assistant::new(),
-            pending_session: None,
             session_name: None,
         };
 
@@ -826,6 +746,7 @@ impl Router<'_> {
         }
 
         self.routes.insert(id, route);
+        id
     }
 
     /// Create the quake dropdown window: borderless, always on top,
@@ -855,7 +776,6 @@ impl Router<'_> {
                 window,
                 path: RoutePath::Terminal,
                 assistant: Assistant::new(),
-                pending_session: None,
                 session_name: None,
             },
         );
@@ -889,7 +809,6 @@ impl Router<'_> {
                 window,
                 path: RoutePath::Terminal,
                 assistant: Assistant::new(),
-                pending_session: None,
                 session_name: None,
             },
         );

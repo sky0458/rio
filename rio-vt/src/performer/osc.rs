@@ -346,6 +346,37 @@ pub(super) fn parse_hyperlink(link_params: &[u8], uri_param: &[u8]) -> Option<Hy
     Some(Hyperlink::new(parse_hyperlink_id(link_params), uri))
 }
 
+/// OSC 9;9 — ConEmu/Windows Terminal current working directory.
+///
+/// Nushell enables this protocol by default on Windows and emits a raw
+/// Windows path (`9;9;C:\\...`). Microsoft's shell-integration examples
+/// also permit surrounding the path with double quotes. Since the OSC
+/// parser splits parameters on semicolons, join the remaining parameters
+/// back together so directories containing `;` are preserved.
+pub(super) fn parse_osc9_9_current_directory(params: &[&[u8]]) -> Option<String> {
+    if params.len() < 3 || params[1] != b"9" {
+        return None;
+    }
+
+    let payload_len = params[2..].iter().map(|part| part.len()).sum::<usize>()
+        + params.len().saturating_sub(3);
+    let mut payload = Vec::with_capacity(payload_len);
+    for (index, part) in params[2..].iter().enumerate() {
+        if index != 0 {
+            payload.push(b';');
+        }
+        payload.extend_from_slice(part);
+    }
+
+    let path = simd_utf8::from_utf8_fast(&payload).ok()?;
+    let path = match path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+        Some(unquoted) => unquoted,
+        None => path,
+    };
+
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
 /// OSC 9;4 — ConEmu/Windows-Terminal progress reporting.
 /// Format: `9;4;<state>;<progress>` (progress optional).
 pub(super) fn parse_progress_report(params: &[&[u8]]) -> Option<ProgressReport> {
@@ -455,6 +486,40 @@ mod tests {
 
     fn cwd(payload: &str) -> Option<String> {
         parse_current_directory(payload.as_bytes())
+    }
+
+    #[test]
+    fn osc9_9_current_directory_accepts_nushell_windows_path() {
+        assert_eq!(
+            parse_osc9_9_current_directory(&[b"9", b"9", br"C:\Users\user\project"]),
+            Some(r"C:\Users\user\project".into())
+        );
+    }
+
+    #[test]
+    fn osc9_9_current_directory_accepts_quoted_windows_terminal_path() {
+        assert_eq!(
+            parse_osc9_9_current_directory(&[b"9", b"9", br#""C:\Program Files\Rio""#,]),
+            Some(r"C:\Program Files\Rio".into())
+        );
+    }
+
+    #[test]
+    fn osc9_9_current_directory_preserves_semicolons() {
+        assert_eq!(
+            parse_osc9_9_current_directory(&[b"9", b"9", br"C:\work", b"project",]),
+            Some(r"C:\work;project".into())
+        );
+    }
+
+    #[test]
+    fn osc9_9_current_directory_rejects_other_or_empty_payloads() {
+        assert_eq!(
+            parse_osc9_9_current_directory(&[b"9", b"4", b"1", b"50"]),
+            None
+        );
+        assert_eq!(parse_osc9_9_current_directory(&[b"9", b"9", b""]), None);
+        assert_eq!(parse_osc9_9_current_directory(&[b"9", b"9"]), None);
     }
 
     #[cfg(not(windows))]
