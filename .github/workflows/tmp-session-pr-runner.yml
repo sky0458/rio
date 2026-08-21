@@ -1,0 +1,77 @@
+name: Temporary Session UI PR Runner
+
+on:
+  pull_request:
+    branches: [dev/session-default-ui]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: session-default-ui-pr-implementation
+  cancel-in-progress: true
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: dev/session-default-ui
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Apply embedded implementation patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+          workflow = Path('.github/workflows/tmp-session-default-ui.yml').read_text()
+          marker = "python3 - <<'PY'\n"
+          if marker not in workflow:
+              raise SystemExit('implementation patch marker missing')
+          body = workflow.split(marker, 1)[1].split("\n          PY", 1)[0]
+          exec(compile(textwrap.dedent(body), 'session-ui-patch.py', 'exec'))
+          PY
+
+      - name: Install Rust and Linux deps
+        run: |
+          rustup toolchain install stable --profile minimal
+          sudo apt-get update -yq
+          sudo apt-get install -yq libasound2-dev libfontconfig1-dev glslang-tools
+
+      - name: Validate implementation
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check -p rioterm
+          cargo test -p rioterm session -- --nocapture
+
+      - name: Commit clean implementation to feature branch
+        run: |
+          rm -f \
+            .github/workflows/tmp-session-default-ui.yml \
+            .github/workflows/tmp-session-runner.yml \
+            .github/workflows/tmp-session-pr-runner.yml \
+            SESSION_UI_TRIGGER
+          git add -- \
+            rio-vt/src/event/mod.rs \
+            frontends/rioterm/src/application.rs \
+            frontends/rioterm/src/context/mod.rs \
+            frontends/rioterm/src/renderer/command_palette.rs \
+            frontends/rioterm/src/router/mod.rs \
+            frontends/rioterm/src/screen/mod.rs \
+            frontends/rioterm/src/session/mod.rs \
+            .github/workflows/tmp-session-default-ui.yml \
+            .github/workflows/tmp-session-runner.yml \
+            .github/workflows/tmp-session-pr-runner.yml \
+            SESSION_UI_TRIGGER
+          git diff --cached --check
+          git commit -m "feat(session): bind default session and expose save restore UI"
+          git push origin HEAD:dev/session-default-ui
