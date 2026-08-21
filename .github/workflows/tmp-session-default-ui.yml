@@ -1,0 +1,182 @@
+name: Temporary Session Default UI Implementation
+
+on:
+  push:
+    branches: [dev/session-default-ui]
+    paths: [.github/workflows/tmp-session-default-ui.yml]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: dev/session-default-ui
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Apply default-session UI and restore changes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f"expected snippet not found in {path}: {old[:120]!r}")
+              p.write_text(s.replace(old, new, 1))
+
+          # 1) Core event: direct default-session restore action.
+          replace_once(
+              "rio-vt/src/event/mod.rs",
+              '''    /// Save the current session to disk (tabs/splits/CWDs/scrollback).\n    SaveSession,\n\n    /// Hide the transient "session saved" notice.\n''',
+              '''    /// Save the default workspace session to `session.json`.\n    SaveSession,\n\n    /// Restore the default workspace session from `session.json`.\n    RestoreSession,\n\n    /// Hide the transient "session saved" notice.\n'''
+          )
+          replace_once(
+              "rio-vt/src/event/mod.rs",
+              '''            RioEvent::SaveSession => write!(f, "SaveSession"),\n            RioEvent::ClearSessionNotice => write!(f, "ClearSessionNotice"),\n''',
+              '''            RioEvent::SaveSession => write!(f, "SaveSession"),\n            RioEvent::RestoreSession => write!(f, "RestoreSession"),\n            RioEvent::ClearSessionNotice => write!(f, "ClearSessionNotice"),\n'''
+          )
+
+          # 2) Context event request used by the command palette.
+          replace_once(
+              "frontends/rioterm/src/context/mod.rs",
+              '''    pub fn request_save_session(&mut self) {\n        self.event_proxy\n            .send_event(RioEvent::SaveSession, self.window_id);\n    }\n\n    #[inline]\n    pub fn request_save_session_as(&mut self, name: String) {\n''',
+              '''    pub fn request_save_session(&mut self) {\n        self.event_proxy\n            .send_event(RioEvent::SaveSession, self.window_id);\n    }\n\n    #[inline]\n    pub fn request_restore_session(&mut self) {\n        self.event_proxy\n            .send_event(RioEvent::RestoreSession, self.window_id);\n    }\n\n    #[inline]\n    pub fn request_save_session_as(&mut self, name: String) {\n'''
+          )
+
+          # 3) Session display-name helper: None is explicitly bound to session.json.
+          replace_once(
+              "frontends/rioterm/src/session/mod.rs",
+              '''pub fn sanitize_name(name: &str) -> String {\n    name.trim()\n        .chars()\n        .map(|c| {\n            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {\n                c\n            } else {\n                '-'\n            }\n        })\n        .collect()\n}\n\npub fn list_sessions() -> Vec<String> {\n''',
+              '''pub fn sanitize_name(name: &str) -> String {\n    name.trim()\n        .chars()\n        .map(|c| {\n            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {\n                c\n            } else {\n                '-'\n            }\n        })\n        .collect()\n}\n\n/// File name shown in the window title for the currently-bound session.\n/// `None` is not "unbound": it is the default persistent `session.json`.\npub fn bound_session_file_name(name: Option<&str>) -> String {\n    match name {\n        None => "session.json".to_string(),\n        Some(name) if name.ends_with(".json") => name.to_string(),\n        Some(name) => format!("{name}.json"),\n    }\n}\n\npub fn list_sessions() -> Vec<String> {\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/session/mod.rs",
+              '''    #[test]\n    fn v2_save_creates_parent_and_round_trips_launch_state() {\n''',
+              '''    #[test]\n    fn bound_session_file_name_defaults_to_session_json() {\n        assert_eq!(bound_session_file_name(None), "session.json");\n        assert_eq!(bound_session_file_name(Some("work")), "work.json");\n        assert_eq!(bound_session_file_name(Some("work.json")), "work.json");\n    }\n\n    #[test]\n    fn v2_save_creates_parent_and_round_trips_launch_state() {\n'''
+          )
+
+          # 4) Route owns title decoration and binding transitions.
+          replace_once(
+              "frontends/rioterm/src/router/mod.rs",
+              '''    #[inline]\n    pub fn set_window_title(&mut self, title: &str) {\n        self.window.winit_window.set_title(title);\n    }\n''',
+              '''    #[inline]\n    pub fn set_window_title(&mut self, title: &str) {\n        let base = if title.trim().is_empty() { RIO_TITLE } else { title };\n        let session = crate::session::bound_session_file_name(self.session_name.as_deref());\n        self.window\n            .winit_window\n            .set_title(&format!("{base} [{session}]"));\n    }\n\n    /// Refresh the title immediately after the session binding changes.\n    pub fn refresh_window_title(&mut self) {\n        let index = self.window.screen.ctx().current_index();\n        let base = self\n            .window\n            .screen\n            .ctx()\n            .title(index)\n            .map(|title| title.content.as_str())\n            .filter(|title| !title.trim().is_empty())\n            .unwrap_or(RIO_TITLE)\n            .to_string();\n        self.set_window_title(&base);\n    }\n\n    /// Bind this route to the persistent default `session.json`.\n    pub fn bind_default_session(&mut self) {\n        self.session_name = None;\n        self.refresh_window_title();\n    }\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/router/mod.rs",
+              '''    /// Palette "Save Session As": bind this window to `name` and save.\n    pub fn save_session_as(&mut self, name: &str) -> bool {\n        let name = crate::session::sanitize_name(name);\n        if name.is_empty() {\n            return false;\n        }\n        self.session_name = Some(name);\n        self.save_session()\n    }\n\n    /// Palette "Restore Session": append the first window of a named workspace.\n    pub fn restore_session_named(&mut self, name: &str) {\n        let path = rio_backend::config::session_named_path(name);\n        if let Some(state) = crate::session::SessionState::load(&path) {\n            self.session_name = Some(name.to_string());\n            if let Some(window) = state.windows.into_iter().next() {\n                if let Err(err) = self.restore_window_state(window, false) {\n                    tracing::warn!("named session restore failed: {err}");\n                }\n            }\n        }\n    }\n''',
+              '''    /// Palette "Save Session As": bind this window to `name` and save.\n    pub fn save_session_as(&mut self, name: &str) -> bool {\n        let name = crate::session::sanitize_name(name);\n        if name.is_empty() {\n            return false;\n        }\n        let previous = self.session_name.replace(name);\n        if self.save_session() {\n            self.refresh_window_title();\n            true\n        } else {\n            self.session_name = previous;\n            false\n        }\n    }\n\n    /// Palette "Restore Session": append the first window of a named workspace.\n    pub fn restore_session_named(&mut self, name: &str) {\n        let path = rio_backend::config::session_named_path(name);\n        if let Some(state) = crate::session::SessionState::load(&path) {\n            if let Some(window) = state.windows.into_iter().next() {\n                match self.restore_window_state(window, false) {\n                    Ok(()) => {\n                        self.session_name = Some(name.to_string());\n                        self.refresh_window_title();\n                    }\n                    Err(err) => tracing::warn!("named session restore failed: {err}"),\n                }\n            }\n        }\n    }\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/router/mod.rs",
+              '''        if let Some(err) = &self.propagated_report {\n            route.report_error(err);\n            self.propagated_report = None;\n        }\n\n        self.routes.insert(id, route);\n''',
+              '''        if let Some(err) = &self.propagated_report {\n            route.report_error(err);\n            self.propagated_report = None;\n        }\n\n        // A normal terminal window is always bound to the default session slot\n        // unless a named session is selected later. Make that state visible\n        // immediately instead of waiting for the first OSC title update.\n        route.refresh_window_title();\n        self.routes.insert(id, route);\n'''
+          )
+
+          # 5) Command palette: add direct default Save/Restore in addition to named pickers.
+          replace_once(
+              "frontends/rioterm/src/renderer/command_palette.rs",
+              '''pub enum PaletteAction {\n    SaveSessionAs,\n    RestoreSessionPicker,\n''',
+              '''pub enum PaletteAction {\n    SaveSession,\n    RestoreSession,\n    SaveSessionAs,\n    RestoreSessionPicker,\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/renderer/command_palette.rs",
+              '''    Command {\n        title: "Save Session As...",\n        shortcut: "",\n        action: PaletteAction::SaveSessionAs,\n    },\n''',
+              '''    Command {\n        title: "Save Session",\n        shortcut: "Ctrl+Shift+S",\n        action: PaletteAction::SaveSession,\n    },\n    Command {\n        title: "Restore Session",\n        shortcut: "",\n        action: PaletteAction::RestoreSession,\n    },\n    Command {\n        title: "Save Session As...",\n        shortcut: "",\n        action: PaletteAction::SaveSessionAs,\n    },\n'''
+          )
+
+          # 6) Screen: robust Shift-character normalization and direct palette dispatch.
+          replace_once(
+              "frontends/rioterm/src/screen/mod.rs",
+              '''                if (mods.shift_key() || mods.alt_key())\n                    || mods.alt_key() && (cfg!(windows) && mods.control_key())\n                {\n                    key.key_without_modifiers()\n                } else {\n                    Key::Character(ch.to_lowercase().into())\n                }\n''',
+              '''                if (mods.shift_key() || mods.alt_key())\n                    || mods.alt_key() && (cfg!(windows) && mods.control_key())\n                {\n                    // Some Windows keyboard layouts can still surface an\n                    // uppercase character after stripping modifiers. Binding\n                    // triggers are normalized lowercase (e.g. Ctrl+Shift+S\n                    // is stored as "s"), so normalize this branch as well.\n                    match key.key_without_modifiers() {\n                        Key::Character(ch) => Key::Character(ch.to_lowercase().into()),\n                        key => key,\n                    }\n                } else {\n                    Key::Character(ch.to_lowercase().into())\n                }\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/screen/mod.rs",
+              '''            PaletteAction::ClearHistory => {\n                let mut terminal = self.context_manager.current_mut().terminal.lock();\n                terminal.clear_saved_history();\n            }\n            PaletteAction::ListFonts => {\n''',
+              '''            PaletteAction::ClearHistory => {\n                let mut terminal = self.context_manager.current_mut().terminal.lock();\n                terminal.clear_saved_history();\n            }\n            PaletteAction::SaveSession => {\n                self.context_manager.request_save_session();\n            }\n            PaletteAction::RestoreSession => {\n                self.context_manager.request_restore_session();\n            }\n            PaletteAction::ListFonts => {\n'''
+          )
+
+          # 7) Application: saving default binds all workspace windows to session.json;
+          # runtime restore replaces the V2 workspace from default session.json.
+          replace_once(
+              "frontends/rioterm/src/application.rs",
+              '''    fn save_default_session(&self, active_id: rio_backend::event::WindowId) -> bool {\n        let ids = self.workspace_window_ids();\n        let active_window = ids.iter().position(|id| *id == active_id).unwrap_or(0);\n        let max = self.config.session.max_scrollback_lines;\n        let windows = ids\n            .iter()\n            .filter_map(|id| self.router.routes.get(id))\n            .map(|route| {\n                crate::session::capture_window(\n                    route.window.screen.ctx(),\n                    max,\n                    &route.window.winit_window,\n                )\n            })\n            .collect::<Vec<_>>();\n        if windows.is_empty() {\n            return false;\n        }\n        let state = crate::session::SessionState {\n            version: crate::session::SESSION_VERSION,\n            windows,\n            active_window,\n        };\n        let p = rio_backend::config::session_file_path();\n        match state.save(&p) {\n            Ok(()) => true,\n            Err(err) => {\n                tracing::warn!("default session save failed at {}: {err}", p.display());\n                false\n            }\n        }\n    }\n''',
+              '''    fn save_default_session(&mut self, active_id: rio_backend::event::WindowId) -> bool {\n        let ids = self.workspace_window_ids();\n        let active_window = ids.iter().position(|id| *id == active_id).unwrap_or(0);\n        let max = self.config.session.max_scrollback_lines;\n        let windows = ids\n            .iter()\n            .filter_map(|id| self.router.routes.get(id))\n            .map(|route| {\n                crate::session::capture_window(\n                    route.window.screen.ctx(),\n                    max,\n                    &route.window.winit_window,\n                )\n            })\n            .collect::<Vec<_>>();\n        if windows.is_empty() {\n            tracing::warn!("default session save skipped: no workspace windows");\n            return false;\n        }\n        let state = crate::session::SessionState {\n            version: crate::session::SESSION_VERSION,\n            windows,\n            active_window,\n        };\n        let p = rio_backend::config::session_file_path();\n        if let Err(err) = state.save(&p) {\n            tracing::warn!("default session save failed at {}: {err}", p.display());\n            return false;\n        }\n\n        // Ctrl+Shift+S and the direct palette Save Session command always\n        // mean the default persistent workspace. Make every ordinary window\n        // explicitly default-bound after the write succeeds.\n        for id in ids {\n            if let Some(route) = self.router.routes.get_mut(&id) {\n                route.bind_default_session();\n            }\n        }\n        tracing::info!("default session saved at {}", p.display());\n        true\n    }\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/application.rs",
+              '''    fn restore_workspace(\n        &mut self,\n        event_loop: &ActiveEventLoop,\n        initial_id: rio_backend::event::WindowId,\n        state: crate::session::SessionState,\n    ) {\n''',
+              '''    fn restore_workspace(\n        &mut self,\n        event_loop: &ActiveEventLoop,\n        initial_id: rio_backend::event::WindowId,\n        state: crate::session::SessionState,\n    ) -> bool {\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/application.rs",
+              '''                    tracing::warn!("default session first window restore failed: {err}");\n                    return;\n''',
+              '''                    tracing::warn!("default session first window restore failed: {err}");\n                    return false;\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/application.rs",
+              '''        if let Some(id) = restored_ids.get(active) {\n            if let Some(route) = self.router.routes.get(id) {\n                route.window.winit_window.focus_window();\n            }\n        }\n    }\n\n    pub fn run(\n''',
+              '''        if let Some(id) = restored_ids.get(active) {\n            if let Some(route) = self.router.routes.get(id) {\n                route.window.winit_window.focus_window();\n            }\n        }\n        !restored_ids.is_empty()\n    }\n\n    fn restore_default_session(\n        &mut self,\n        event_loop: &ActiveEventLoop,\n        initial_id: rio_backend::event::WindowId,\n    ) -> bool {\n        let path = rio_backend::config::session_file_path();\n        let Some(state) = crate::session::SessionState::load(&path) else {\n            tracing::warn!("default session restore skipped: {} is missing or invalid", path.display());\n            return false;\n        };\n\n        // Preserve the currently-targeted window until the first saved window\n        // restores successfully. Other old workspace windows are removed only\n        // after that point, so a bad session cannot destroy the live workspace.\n        let stale_ids = self\n            .workspace_window_ids()\n            .into_iter()\n            .filter(|id| *id != initial_id)\n            .collect::<Vec<_>>();\n        if !self.restore_workspace(event_loop, initial_id, state) {\n            return false;\n        }\n        for id in stale_ids {\n            self.router.routes.remove(&id);\n        }\n        for id in self.workspace_window_ids() {\n            if let Some(route) = self.router.routes.get_mut(&id) {\n                route.bind_default_session();\n            }\n        }\n        true\n    }\n\n    pub fn run(\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/application.rs",
+              '''                if let Some(route) = self.router.routes.get_mut(&initial_window_id) {\n                    route.session_name = Some(name.clone());\n                    if let Some(state) = crate::session::SessionState::load(\n''',
+              '''                if let Some(route) = self.router.routes.get_mut(&initial_window_id) {\n                    route.session_name = Some(name.clone());\n                    route.refresh_window_title();\n                    if let Some(state) = crate::session::SessionState::load(\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/application.rs",
+              '''            ) {\n                self.restore_workspace(event_loop, initial_window_id, state);\n            }\n''',
+              '''            ) {\n                let _ = self.restore_workspace(event_loop, initial_window_id, state);\n            }\n'''
+          )
+          replace_once(
+              "frontends/rioterm/src/application.rs",
+              '''            RioEventType::Rio(RioEvent::SaveSessionAs(name)) => {\n''',
+              '''            RioEventType::Rio(RioEvent::RestoreSession) => {\n                if self.restore_default_session(event_loop, window_id) {\n                    if let Some(route) = self.router.routes.get_mut(&window_id) {\n                        route.request_redraw();\n                    }\n                }\n            }\n            RioEventType::Rio(RioEvent::SaveSessionAs(name)) => {\n'''
+          )
+
+          PY
+
+      - name: Install Rust and Linux deps
+        run: |
+          rustup toolchain install stable --profile minimal
+          sudo apt-get update -yq
+          sudo apt-get install -yq libasound2-dev libfontconfig1-dev glslang-tools
+
+      - name: Format and validate
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check -p rioterm
+          cargo test -p rioterm session -- --nocapture
+
+      - name: Commit implementation and self-clean
+        run: |
+          rm .github/workflows/tmp-session-default-ui.yml
+          git add -- \
+            rio-vt/src/event/mod.rs \
+            frontends/rioterm/src/application.rs \
+            frontends/rioterm/src/context/mod.rs \
+            frontends/rioterm/src/renderer/command_palette.rs \
+            frontends/rioterm/src/router/mod.rs \
+            frontends/rioterm/src/screen/mod.rs \
+            frontends/rioterm/src/session/mod.rs \
+            .github/workflows/tmp-session-default-ui.yml
+          git commit -m "feat(session): bind default session and expose save restore UI"
+          git push origin HEAD:dev/session-default-ui
