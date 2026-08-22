@@ -41,8 +41,8 @@ jobs:
           workspaces: . -> target
           key: session-persistence-${{ matrix.os }}
 
-      - name: Test session persistence
-        run: cargo test -p rioterm session_persistence_tests -- --nocapture
+      - name: Test Session V2 persistence
+        run: cargo test -p rioterm session::tests -- --nocapture
 
       - name: Verify session scrollback round trip
         run: cargo test -p rio-vt scrollback_ansi_round_trip
@@ -112,28 +112,32 @@ jobs:
           name: rio-session-restore-windows-x86_64
           path: dist
 
-      - name: Publish session-restore-preview
+      - name: Publish Windows Session V2 previews
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          TAG="session-restore-preview"
           SHORT_SHA="${RELEASE_SHA::7}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f "$TAG" "$RELEASE_SHA"
-          git push --force origin "refs/tags/$TAG"
 
           cat > release-notes.md <<EOF
-          Windows x64 preview build of Rio with upstream PR #1704 session save/restore merged onto the fork's main baseline.
+          Windows x64 preview build of Rio from the merged \`session-restore\` branch.
 
           Commit: \`$RELEASE_SHA\`
           Branch: \`session-restore\`
 
+          Highlights:
+          - Session V2 workspace restore across windows, tabs and splits
+          - per-pane launch command and current working directory restore
+          - Windows current-pane CWD inheritance for new tabs/splits
+          - Nushell OSC 9;9 current-directory support
+          - optional scrollback persistence
+
           Session persistence is regression-tested on GitHub Windows Server 2022 and 2025 before packaging.
-          This is an unsigned test build. Windows may show a SmartScreen warning.
+          This is an unsigned preview build. Windows may show a SmartScreen warning.
 
           Assets:
           - \`rio-session-restore-windows-x86_64.zip\` — portable package
@@ -141,17 +145,30 @@ jobs:
           - \`SHA256SUMS.txt\` — checksums
           EOF
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" \
-              --title "Rio Session Restore Preview ($SHORT_SHA)" \
-              --notes-file release-notes.md \
-              --prerelease
-          else
-            gh release create "$TAG" \
-              --target "$RELEASE_SHA" \
-              --title "Rio Session Restore Preview ($SHORT_SHA)" \
-              --notes-file release-notes.md \
-              --prerelease
-          fi
+          publish_preview() {
+            TAG="$1"
+            TITLE="$2"
 
-          gh release upload "$TAG" dist/* --clobber
+            git tag -f "$TAG" "$RELEASE_SHA"
+            git push --force origin "refs/tags/$TAG"
+
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release edit "$TAG" \
+                --title "$TITLE ($SHORT_SHA)" \
+                --notes-file release-notes.md \
+                --prerelease
+            else
+              gh release create "$TAG" \
+                --target "$RELEASE_SHA" \
+                --title "$TITLE ($SHORT_SHA)" \
+                --notes-file release-notes.md \
+                --prerelease
+            fi
+
+            gh release upload "$TAG" dist/* --clobber
+          }
+
+          # Canonical preview advertised in README.
+          publish_preview "windows-current-pane-cwd-preview" "Rio Windows Session V2 Preview"
+          # Keep the previous rolling tag working for existing users/bookmarks.
+          publish_preview "session-restore-preview" "Rio Session Restore Preview"
