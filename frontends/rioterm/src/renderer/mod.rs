@@ -174,9 +174,6 @@ pub struct Renderer {
     pub assistant: assistant::AssistantOverlay,
     pub confirm_quit: confirm_quit::ConfirmQuit,
     pub session_prompt: session_prompt::SessionPrompt,
-    /// `[session]` config snapshot the prompt/save flows read — the
-    /// renderer is rebuilt on config reload so this stays current.
-    pub session_restore: rio_backend::config::session::SessionRestore,
     pub session_max_scrollback: usize,
     pub scrollbar: scrollbar::Scrollbar,
     #[allow(unused)]
@@ -268,7 +265,6 @@ impl Renderer {
             assistant: assistant::AssistantOverlay::default(),
             confirm_quit: confirm_quit::ConfirmQuit::default(),
             session_prompt: session_prompt::SessionPrompt::default(),
-            session_restore: config.session.restore,
             session_max_scrollback: config.session.max_scrollback_lines,
             scrollbar: scrollbar::Scrollbar::new(config.enable_scroll_bar),
             is_game_mode_enabled: config.renderer.strategy.is_game(),

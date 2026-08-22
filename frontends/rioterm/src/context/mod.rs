@@ -57,6 +57,8 @@ pub struct Context<T: EventListener> {
     pub rich_text_id: usize,
     pub dimension: ContextDimension,
     pub title: ContextTitle,
+    /// Program/arguments actually used to launch this pane.
+    pub launch: Shell,
     pub ime: Ime,
     _io_thread: Option<JoinHandle<(Machine<teletypewriter::Pty, T>, performer::State)>>,
 }
@@ -172,6 +174,7 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
         rich_text_id,
         dimension,
         title: ContextTitle::default(),
+        launch: Shell::default(),
         ime: Ime::new(),
         _io_thread: None,
     }
@@ -225,6 +228,27 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         dimension: ContextDimension,
         config: &ContextManagerConfig,
     ) -> Result<Context<T>, Box<dyn Error>> {
+        Self::create_context_with_scrollback(
+            cursor_state,
+            event_proxy,
+            window_id,
+            rich_text_id,
+            dimension,
+            config,
+            None,
+        )
+    }
+
+    #[inline]
+    fn create_context_with_scrollback(
+        cursor_state: (&Cursor, bool),
+        event_proxy: T,
+        window_id: WindowId,
+        rich_text_id: usize,
+        dimension: ContextDimension,
+        config: &ContextManagerConfig,
+        initial_scrollback: Option<&str>,
+    ) -> Result<Context<T>, Box<dyn Error>> {
         let route_id = ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         #[cfg(test)]
@@ -253,6 +277,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         );
         terminal.set_grapheme_clustering(config.grapheme_clustering);
         terminal.blinking_cursor = cursor_state.1;
+        // The spawn cwd is already authoritative before the shell emits its first
+        // OSC 7/9;9 report. This also makes immediate split/tab creation inherit
+        // correctly during shell startup.
+        if let Some(cwd) = config.working_dir.as_deref() {
+            terminal.current_directory = Some(std::path::PathBuf::from(cwd));
+        }
+        // Replay optional visual history before the PTY performer can write the
+        // fresh shell prompt into this terminal.
+        if let Some(scrollback) = initial_scrollback.filter(|content| !content.is_empty())
+        {
+            let mut processor = rio_backend::performer::handler::Processor::default();
+            processor.advance(&mut terminal, scrollback.as_bytes());
+        }
         let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
 
         let pty;
@@ -346,6 +383,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             renderable_content: RenderableContent::new(cursor_state.0.clone()),
             dimension,
             title: ContextTitle::default(),
+            launch: config.shell.clone(),
             ime: Ime::new(),
             _io_thread: io_thread,
         })
@@ -873,99 +911,118 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    /// Split the current pane, spawning the new pane's shell at `dir`.
-    /// Forces the spawn (non-fork) pty path — the fork path has no
-    /// working-directory support.
-    pub fn split_with_dir(
+    /// Split a restored pane from its saved launch specification.
+    pub fn split_from_session(
         &mut self,
         rich_text_id: usize,
         split_down: bool,
         sugarloaf: &mut Sugarloaf,
-        dir: Option<String>,
-    ) {
+        pane: &crate::session::PaneState,
+    ) -> Result<(), String> {
         let mut cloned_config = self.config.clone();
-        if dir.is_some() {
-            cloned_config.working_dir = dir;
-            #[cfg(not(target_os = "windows"))]
-            {
-                cloned_config.use_fork = false;
-            }
+        cloned_config.shell = pane.launch.clone();
+        cloned_config.working_dir = pane.cwd.clone();
+        #[cfg(not(target_os = "windows"))]
+        {
+            cloned_config.use_fork = false;
         }
 
         let current = self.current();
         let cursor = current.cursor_from_ref();
-
-        match ContextManager::create_context(
-            (&cursor, current.renderable_content.has_blinking_enabled),
-            self.event_proxy.clone(),
-            self.window_id,
-            rich_text_id,
-            self.current().dimension,
-            &cloned_config,
-        ) {
-            Ok(new_context) => {
-                let new_route_id = new_context.route_id;
-                if split_down {
-                    self.contexts[self.current_index].split_down(new_context, sugarloaf);
-                } else {
-                    self.contexts[self.current_index].split_right(new_context, sugarloaf);
-                }
-                self.current_route = new_route_id;
+        let dimension = current.dimension;
+        let blinking = current.renderable_content.has_blinking_enabled;
+        let make = |config: &ContextManagerConfig| {
+            ContextManager::create_context_with_scrollback(
+                (&cursor, blinking),
+                self.event_proxy.clone(),
+                self.window_id,
+                rich_text_id,
+                dimension,
+                config,
+                pane.scrollback.as_deref(),
+            )
+        };
+        let new_context = match make(&cloned_config) {
+            Ok(context) => context,
+            Err(first) if pane.cwd.is_some() => {
+                tracing::warn!(
+                    "session cwd spawn failed, retrying configured cwd: {first}"
+                );
+                let mut fallback = cloned_config.clone();
+                fallback.working_dir = self.config.working_dir.clone();
+                make(&fallback).map_err(|err| err.to_string())?
             }
-            Err(..) => {
-                tracing::error!("session restore: not able to create a split context");
-            }
+            Err(err) => return Err(err.to_string()),
+        };
+        let new_route_id = new_context.route_id;
+        if split_down {
+            self.contexts[self.current_index].split_down(new_context, sugarloaf);
+        } else {
+            self.contexts[self.current_index].split_right(new_context, sugarloaf);
         }
+        self.current_route = new_route_id;
+        Ok(())
     }
 
-    /// Add a tab whose shell spawns at `dir` (session restore). Same
-    /// spawn-path requirement as `split_with_dir`.
-    pub fn add_context_with_dir(&mut self, rich_text_id: usize, dir: Option<String>) {
+    /// Add a restored tab from its first pane's saved launch specification.
+    pub fn add_context_from_session(
+        &mut self,
+        rich_text_id: usize,
+        pane: &crate::session::PaneState,
+    ) -> Result<usize, String> {
+        if self.contexts.len() >= self.capacity {
+            return Err("session restore exceeded tab capacity".to_string());
+        }
         let mut cloned_config = self.config.clone();
-        if dir.is_some() {
-            cloned_config.working_dir = dir;
-            #[cfg(not(target_os = "windows"))]
-            {
-                cloned_config.use_fork = false;
-            }
+        cloned_config.shell = pane.launch.clone();
+        cloned_config.working_dir = pane.cwd.clone();
+        #[cfg(not(target_os = "windows"))]
+        {
+            cloned_config.use_fork = false;
         }
 
-        if self.contexts.len() >= self.capacity {
-            return;
-        }
         let last_index = self.contexts.len();
         let current = self.current();
         let cursor = current.cursor_from_ref();
+        let blinking = current.renderable_content.has_blinking_enabled;
         let mut dimension = current.dimension;
         if self.current_grid().len() > 1 {
             dimension = self.current_grid().grid_dimension();
         }
-
-        match ContextManager::create_context(
-            (&cursor, current.renderable_content.has_blinking_enabled),
-            self.event_proxy.clone(),
-            self.window_id,
-            rich_text_id,
-            dimension,
-            &cloned_config,
-        ) {
-            Ok(new_context) => {
-                let previous_scaled_margin =
-                    self.contexts[self.current_index].scaled_margin;
-                self.contexts.push(ContextGrid::new(
-                    new_context,
-                    previous_scaled_margin,
-                    self.config.split_color,
-                    self.config.split_active_color,
-                    self.config.panel,
-                ));
-                self.current_index = last_index;
-                self.current_route = self.current().route_id;
+        let make = |config: &ContextManagerConfig| {
+            ContextManager::create_context_with_scrollback(
+                (&cursor, blinking),
+                self.event_proxy.clone(),
+                self.window_id,
+                rich_text_id,
+                dimension,
+                config,
+                pane.scrollback.as_deref(),
+            )
+        };
+        let new_context = match make(&cloned_config) {
+            Ok(context) => context,
+            Err(first) if pane.cwd.is_some() => {
+                tracing::warn!(
+                    "session cwd spawn failed, retrying configured cwd: {first}"
+                );
+                let mut fallback = cloned_config.clone();
+                fallback.working_dir = self.config.working_dir.clone();
+                make(&fallback).map_err(|err| err.to_string())?
             }
-            Err(..) => {
-                tracing::error!("session restore: not able to create a tab context");
-            }
-        }
+            Err(err) => return Err(err.to_string()),
+        };
+        let previous_scaled_margin = self.contexts[self.current_index].scaled_margin;
+        self.contexts.push(ContextGrid::new(
+            new_context,
+            previous_scaled_margin,
+            self.config.split_color,
+            self.config.split_active_color,
+            self.config.panel,
+        ));
+        self.current_index = last_index;
+        self.current_route = self.current().route_id;
+        Ok(last_index)
     }
 
     #[inline]
@@ -1140,11 +1197,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
             #[cfg(target_os = "windows")]
             {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
+                let tracked = self.current().terminal.lock().current_directory.clone();
+                if let Some(path) = tracked {
+                    working_dir = Some(path.to_string_lossy().into_owned());
+                }
             }
         }
 
@@ -1260,11 +1316,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
             #[cfg(target_os = "windows")]
             {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
+                let tracked = self.current().terminal.lock().current_directory.clone();
+                if let Some(path) = tracked {
+                    working_dir = Some(path.to_string_lossy().into_owned());
+                }
             }
         }
 
@@ -1331,7 +1386,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 context.set_all_rich_text_visibility(sugarloaf, true);
                 continue;
             }
-
             context.set_all_rich_text_visibility(sugarloaf, false);
         }
     }

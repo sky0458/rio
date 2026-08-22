@@ -152,6 +152,102 @@ impl Application<'_> {
         rio_notifier::send_notification(title, body);
     }
 
+    fn workspace_window_ids(&self) -> Vec<rio_backend::event::WindowId> {
+        let mut ids: Vec<_> = self
+            .router
+            .routes
+            .keys()
+            .copied()
+            .filter(|id| Some(*id) != self.router.quake_window_id)
+            .filter(|id| Some(*id) != self.router.config_route)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn save_default_session(&self, active_id: rio_backend::event::WindowId) -> bool {
+        let ids = self.workspace_window_ids();
+        let active_window = ids.iter().position(|id| *id == active_id).unwrap_or(0);
+        let max = self.config.session.max_scrollback_lines;
+        let windows = ids
+            .iter()
+            .filter_map(|id| self.router.routes.get(id))
+            .map(|route| {
+                crate::session::capture_window(
+                    route.window.screen.ctx(),
+                    max,
+                    &route.window.winit_window,
+                )
+            })
+            .collect::<Vec<_>>();
+        if windows.is_empty() {
+            return false;
+        }
+        let state = crate::session::SessionState {
+            version: crate::session::SESSION_VERSION,
+            windows,
+            active_window,
+        };
+        let p = rio_backend::config::session_file_path();
+        match state.save(&p) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!("default session save failed at {}: {err}", p.display());
+                false
+            }
+        }
+    }
+
+    fn restore_workspace(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        initial_id: rio_backend::event::WindowId,
+        state: crate::session::SessionState,
+    ) {
+        let active = state
+            .active_window
+            .min(state.windows.len().saturating_sub(1));
+        let mut restored_ids = Vec::with_capacity(state.windows.len());
+        let mut windows = state.windows.into_iter();
+        if let Some(first) = windows.next() {
+            if let Some(route) = self.router.routes.get_mut(&initial_id) {
+                if let Err(err) = route.restore_window_state(first, true) {
+                    tracing::warn!("default session first window restore failed: {err}");
+                    return;
+                }
+                restored_ids.push(initial_id);
+            }
+        }
+        for window in windows {
+            let id = self.router.create_window(
+                event_loop,
+                self.event_proxy.clone(),
+                &self.config,
+                None,
+                self.app_id.as_deref(),
+            );
+            let ok = self
+                .router
+                .routes
+                .get_mut(&id)
+                .map(|route| route.restore_window_state(window, true))
+                .transpose();
+            match ok {
+                Ok(Some(())) => restored_ids.push(id),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("default session extra window restore failed: {err}");
+                    self.router.routes.remove(&id);
+                }
+            }
+        }
+        if let Some(id) = restored_ids.get(active) {
+            if let Some(route) = self.router.routes.get(id) {
+                route.window.winit_window.focus_window();
+            }
+        }
+    }
+
     pub fn run(
         &mut self,
         event_loop: EventLoop<EventPayload>,
@@ -327,7 +423,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             .or_else(|| event_loop.system_theme());
         update_colors_based_on_theme(&mut self.config, theme);
 
-        self.router.create_window(
+        let initial_window_id = self.router.create_window(
             event_loop,
             self.event_proxy.clone(),
             &self.config,
@@ -337,39 +433,21 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
         if cause == StartCause::Init {
             self.setup_quake_hotkey();
-        }
 
-        if let Some(name) = self.session_name.clone() {
-            // `rio --session <name>`: explicit binding restores the
-            // named session (when it exists) regardless of the
-            // configured restore mode, and saves write back to it.
-            let name = crate::session::sanitize_name(&name);
-            if let Some(route) = self.router.routes.values_mut().next() {
-                route.session_name = Some(name.clone());
-                if let Some(state) = crate::session::SessionState::load(
-                    &rio_backend::config::session_named_path(&name),
-                ) {
-                    route.restore_session(state);
-                }
-            }
-        } else {
-            match self.config.session.restore {
-                rio_backend::config::session::SessionRestore::Never => {}
-                mode => {
+            if let Some(name) = self.session_name.clone() {
+                let name = crate::session::sanitize_name(&name);
+                if let Some(route) = self.router.routes.get_mut(&initial_window_id) {
+                    route.session_name = Some(name.clone());
                     if let Some(state) = crate::session::SessionState::load(
-                        &rio_backend::config::session_file_path(),
+                        &rio_backend::config::session_named_path(&name),
                     ) {
-                        if let Some(route) = self.router.routes.values_mut().next() {
-                            if mode
-                                == rio_backend::config::session::SessionRestore::Always
-                            {
-                                route.restore_session(state);
-                            } else {
-                                route.prompt_session_resume(state);
-                            }
-                        }
+                        route.restore_session(state);
                     }
                 }
+            } else if let Some(state) = crate::session::SessionState::load(
+                &rio_backend::config::session_file_path(),
+            ) {
+                self.restore_workspace(event_loop, initial_window_id, state);
             }
         }
 
@@ -643,8 +721,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::SaveSession) => {
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    if route.save_session() {
+                if self.save_default_session(window_id) {
+                    if let Some(route) = self.router.routes.get_mut(&window_id) {
                         route
                             .window
                             .screen
@@ -2393,30 +2471,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     // This is irreversible - if this event is emitted, it is guaranteed to be the last event that gets emitted.
     // You generally want to treat this as an “do on quit” event.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        if self.config.session.restore
-            == rio_backend::config::session::SessionRestore::Always
-        {
-            let max = self.config.session.max_scrollback_lines;
-            let windows: Vec<crate::session::WindowState> = self
-                .router
-                .routes
-                .values()
-                .map(|route| {
-                    crate::session::capture_window(
-                        route.window.screen.ctx(),
-                        max,
-                        &route.window.winit_window,
-                    )
-                })
-                .collect();
-            if !windows.is_empty() {
-                let state = crate::session::SessionState {
-                    version: crate::session::SESSION_VERSION,
-                    windows,
-                };
-                let _ = state.save(&rio_backend::config::session_file_path());
-            }
-        }
+        // The default V2 snapshot is persistent and only replaced by an
+        // explicit SaveSession action (Ctrl+Shift+S). Exiting must not
+        // silently overwrite it.
 
         // Ensure that all the windows are dropped, so the destructors for
         // Renderer and contexts ran.
