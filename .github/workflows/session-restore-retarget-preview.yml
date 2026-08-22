@@ -1,0 +1,58 @@
+name: Retarget Session Restore Preview
+
+on:
+  push:
+    branches:
+      - session-restore
+
+permissions:
+  contents: write
+
+concurrency:
+  group: session-restore-preview-retarget
+  cancel-in-progress: true
+
+jobs:
+  retarget-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout latest session-restore HEAD
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Retarget rolling preview releases to latest HEAD
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${RELEASE_SHA::7}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          retarget() {
+            TAG="$1"
+            TITLE="$2"
+
+            git tag -f "$TAG" "$RELEASE_SHA"
+            git push --force origin "refs/tags/$TAG"
+
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release edit "$TAG" \
+                --target "$RELEASE_SHA" \
+                --title "$TITLE ($SHORT_SHA)" \
+                --prerelease
+            else
+              gh release create "$TAG" \
+                --target "$RELEASE_SHA" \
+                --title "$TITLE ($SHORT_SHA)" \
+                --notes "Rolling Windows preview for the latest session-restore HEAD: $RELEASE_SHA" \
+                --prerelease
+            fi
+          }
+
+          retarget "windows-current-pane-cwd-preview" "Rio Windows Session V2 Preview"
+          retarget "session-restore-preview" "Rio Session Restore Preview"
