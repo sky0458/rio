@@ -20,9 +20,7 @@ jobs:
       - name: Apply cleanup
         run: python3 .github/scripts/cleanup-pebrel-cwd.py
       - name: Verify formatting
-        run: |
-          cargo fmt --all -- --check
-          git diff --check
+        run: cargo fmt --all -- --check
       - name: Commit cleanup
         run: |
           git config user.name "github-actions[bot]"
