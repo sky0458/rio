@@ -22,7 +22,7 @@
 Documentation: [rioterm.com](https://rioterm.com).
 
 > **Windows Session V2 + current-pane CWD + Nushell build**  
-> Restores workspace windows, tabs/splits, per-pane CWD and optional scrollback; Windows split/new-tab CWD inheritance supports Nushell OSC 9;9.  
+> Restores workspace windows, tabs/splits, per-pane CWD and optional scrollback; Windows new-window/new-tab/split CWD inheritance supports Nushell OSC 9;9.  
 > **[Download the Windows x64 release](https://github.com/sky0458/rio/releases/tag/windows-current-pane-cwd-preview)** · unsigned preview build for Windows 10 1809+ / Windows 11.
 
 ## Supporting the Project
