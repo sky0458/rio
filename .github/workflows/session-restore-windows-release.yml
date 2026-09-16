@@ -132,7 +132,7 @@ jobs:
           Highlights:
           - Session V2 workspace restore across windows, tabs and splits
           - per-pane launch command and current working directory restore
-          - Windows current-pane CWD inheritance for new windows, tabs and splits
+          - Windows current-pane CWD inheritance for new tabs/splits
           - Nushell OSC 9;9 current-directory support
           - optional scrollback persistence
 
