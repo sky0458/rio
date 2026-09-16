@@ -17,7 +17,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Diagnose main merge conflicts
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev glslang-tools
+
+      - name: Merge main and resolve session deltas
         shell: bash
         run: |
           set -euo pipefail
@@ -28,18 +33,15 @@ jobs:
             echo "main is already an ancestor of session-restore"
             exit 0
           fi
-          set +e
-          git merge --no-ff --no-commit origin/main
-          rc=$?
-          set -e
-          echo "merge exit code: $rc"
-          git status --short
-          echo "UNMERGED FILES:"
-          git diff --name-only --diff-filter=U
-          if [ "$rc" -ne 0 ]; then
-            echo "CONFLICT DIFF:"
-            git diff --cc
+          git merge --no-ff --no-commit origin/main || true
+          python3 .github/scripts/resolve-session-restore-sync.py
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "Unresolved merge conflicts remain"
+            git diff --name-only --diff-filter=U
             exit 1
           fi
-          git commit -m "chore: merge main into session-restore"
+          git add -A
+          cargo fmt --all -- --check
+          cargo check -p rioterm
+          git commit -m "chore: merge main into session-restore and inherit focused cwd"
           git push origin HEAD:session-restore
