@@ -20,7 +20,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfontconfig1-dev
+          sudo apt-get install -y libfontconfig1-dev glslang-tools
 
       - name: Merge main without touching main
         shell: bash
