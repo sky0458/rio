@@ -4,27 +4,171 @@ on:
   push:
     branches:
       - session-restore
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: session-restore-windows-preview
+  cancel-in-progress: true
+
+env:
+  RELEASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
 jobs:
-  cleanup-pebrel-cwd:
-    runs-on: ubuntu-latest
+  test-windows:
+    name: Test Windows persistence (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout feature head
+        uses: actions/checkout@v4
         with:
-          ref: session-restore
-          fetch-depth: 0
-      - name: Apply cleanup
-        run: python3 .github/scripts/cleanup-pebrel-cwd.py
-      - name: Verify formatting
-        run: cargo fmt --all -- --check
-      - name: Commit cleanup
+          ref: ${{ env.RELEASE_SHA }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: session-persistence-${{ matrix.os }}
+
+      - name: Test Session V2 persistence
+        run: cargo test -p rioterm session::tests -- --nocapture
+
+      - name: Verify session scrollback round trip
+        run: cargo test -p rio-vt scrollback_ansi_round_trip
+
+  build-windows:
+    name: Build Windows x64
+    needs: test-windows
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout feature head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Build Rio release binary
+        run: cargo build --release -p rioterm
+
+      - name: Package unsigned portable build
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+
+          Copy-Item target/release/rio.exe package/rio.exe
+          Copy-Item LICENSE package/LICENSE
+          Copy-Item README.md package/README.md
+
+          Compress-Archive -Path package/* -DestinationPath dist/rio-session-restore-windows-x86_64.zip -Force
+          Copy-Item target/release/rio.exe dist/rio-session-restore-windows-x86_64.exe
+
+          $zipHash = (Get-FileHash dist/rio-session-restore-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          $exeHash = (Get-FileHash dist/rio-session-restore-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+          @(
+            "$zipHash  rio-session-restore-windows-x86_64.zip",
+            "$exeHash  rio-session-restore-windows-x86_64.exe"
+          ) | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rio-session-restore-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish rolling prerelease
+    needs: build-windows
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout feature head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: rio-session-restore-windows-x86_64
+          path: dist
+
+      - name: Publish Windows Session V2 previews
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${RELEASE_SHA::7}"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "revert: drop duplicate Pebrel cwd inheritance"
-          git push origin HEAD:session-restore
+
+          cat > release-notes.md <<EOF
+          Windows x64 preview build of Rio from the merged \`session-restore\` branch.
+
+          Commit: \`$RELEASE_SHA\`
+          Branch: \`session-restore\`
+
+          Highlights:
+          - Session V2 workspace restore across windows, tabs and splits
+          - per-pane launch command and current working directory restore
+          - Windows current-pane CWD inheritance for new windows, tabs and splits
+          - Nushell OSC 9;9 current-directory support
+          - optional scrollback persistence
+
+          Session persistence is regression-tested on GitHub Windows Server 2022 and 2025 before packaging.
+          This is an unsigned preview build. Windows may show a SmartScreen warning.
+
+          Assets:
+          - \`rio-session-restore-windows-x86_64.zip\` — portable package
+          - \`rio-session-restore-windows-x86_64.exe\` — raw executable
+          - \`SHA256SUMS.txt\` — checksums
+          EOF
+
+          publish_preview() {
+            TAG="$1"
+            TITLE="$2"
+
+            git tag -f "$TAG" "$RELEASE_SHA"
+            git push --force origin "refs/tags/$TAG"
+
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release edit "$TAG" \
+                --title "$TITLE ($SHORT_SHA)" \
+                --notes-file release-notes.md \
+                --prerelease
+            else
+              gh release create "$TAG" \
+                --target "$RELEASE_SHA" \
+                --title "$TITLE ($SHORT_SHA)" \
+                --notes-file release-notes.md \
+                --prerelease
+            fi
+
+            gh release upload "$TAG" dist/* --clobber
+          }
+
+          # Canonical preview advertised in README.
+          publish_preview "windows-current-pane-cwd-preview" "Rio Windows Session V2 Preview"
+          # Keep the previous rolling tag working for existing users/bookmarks.
+          publish_preview "session-restore-preview" "Rio Session Restore Preview"

@@ -175,7 +175,7 @@ pub enum RioEvent {
     Hide,
     HideOtherApplications,
     UpdateConfig,
-    CreateWindow(Option<String>),
+    CreateWindow,
     ToggleQuake,
     CloseWindow,
     CreateNativeTab(Option<String>),
@@ -366,7 +366,7 @@ impl Debug for RioEvent {
             RioEvent::ChildExited(route, status) => {
                 write!(f, "ChildExited(route={route}, status={status:?})")
             }
-            RioEvent::CreateWindow(_) => write!(f, "CreateWindow"),
+            RioEvent::CreateWindow => write!(f, "CreateWindow"),
             RioEvent::ToggleQuake => write!(f, "ToggleQuake"),
             RioEvent::CloseWindow => write!(f, "CloseWindow"),
             RioEvent::CreateNativeTab(_) => write!(f, "CreateNativeTab"),

@@ -1117,20 +1117,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     item.val.messenger.send_bytes(format(color).into_bytes());
                 }
             }
-            RioEventType::Rio(RioEvent::CreateWindow(working_dir)) => {
-                let mut config = self.config.clone();
-                if let Some(working_dir) = working_dir {
-                    config.working_dir = Some(working_dir);
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        // The fork PTY path has no working-directory parameter.
-                        config.use_fork = false;
-                    }
-                }
+            RioEventType::Rio(RioEvent::CreateWindow) => {
                 self.router.create_window(
                     event_loop,
                     self.event_proxy.clone(),
-                    &config,
+                    &self.config,
                     None,
                     self.app_id.as_deref(),
                 );

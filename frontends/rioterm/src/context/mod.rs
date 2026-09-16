@@ -595,10 +595,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn create_new_window(&self) {
-        self.event_proxy.send_event(
-            RioEvent::CreateWindow(self.focused_working_dir()),
-            self.window_id,
-        );
+        self.event_proxy
+            .send_event(RioEvent::CreateWindow, self.window_id);
     }
 
     #[inline]
@@ -1177,46 +1175,33 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.set_current(target);
     }
 
-    /// Resolve the startup directory for a child pane/window from the focused
-    /// terminal. Dynamic terminal reports are trusted only when absolute and
-    /// free of control characters; otherwise the configured directory wins.
-    fn focused_working_dir(&self) -> Option<String> {
-        if !self.config.cwd {
-            return self.config.working_dir.clone();
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        let reported = {
-            let current = self.current();
-            teletypewriter::foreground_process_path(*current.main_fd, current.shell_pid)
-                .ok()
-                .map(|path| path.to_string_lossy().into_owned())
-        };
-
-        #[cfg(target_os = "windows")]
-        let reported = self
-            .current()
-            .terminal
-            .lock()
-            .current_directory
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
-
-        reported
-            .filter(|cwd| {
-                std::path::Path::new(cwd).is_absolute()
-                    && !cwd.chars().any(char::is_control)
-            })
-            .or_else(|| self.config.working_dir.clone())
-    }
-
     pub fn split(
         &mut self,
         rich_text_id: usize,
         split_down: bool,
         sugarloaf: &mut Sugarloaf,
     ) {
-        let working_dir = self.focused_working_dir();
+        let mut working_dir = self.config.working_dir.clone();
+        if self.config.cwd {
+            #[cfg(not(target_os = "windows"))]
+            {
+                let current_context = self.current();
+                if let Ok(path) = teletypewriter::foreground_process_path(
+                    *current_context.main_fd,
+                    current_context.shell_pid,
+                ) {
+                    working_dir = Some(path.to_string_lossy().to_string());
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let tracked = self.current().terminal.lock().current_directory.clone();
+                if let Some(path) = tracked {
+                    working_dir = Some(path.to_string_lossy().into_owned());
+                }
+            }
+        }
 
         let mut cloned_config = self.config.clone();
         if working_dir.is_some() {
@@ -1315,7 +1300,27 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
-        let working_dir = self.focused_working_dir();
+        let mut working_dir = self.config.working_dir.clone();
+        if self.config.cwd {
+            #[cfg(not(target_os = "windows"))]
+            {
+                let current_context = self.current();
+                if let Ok(path) = teletypewriter::foreground_process_path(
+                    *current_context.main_fd,
+                    current_context.shell_pid,
+                ) {
+                    working_dir = Some(path.to_string_lossy().to_string());
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let tracked = self.current().terminal.lock().current_directory.clone();
+                if let Some(path) = tracked {
+                    working_dir = Some(path.to_string_lossy().into_owned());
+                }
+            }
+        }
 
         if self.config.is_native {
             self.event_proxy
