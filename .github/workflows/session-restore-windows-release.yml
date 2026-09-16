@@ -4,10 +4,6 @@ on:
   push:
     branches:
       - session-restore
-  pull_request:
-    branches:
-      - main
-    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -17,158 +13,133 @@ concurrency:
   group: session-restore-windows-preview
   cancel-in-progress: true
 
-env:
-  RELEASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-
 jobs:
-  test-windows:
-    name: Test Windows persistence (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022, windows-2025]
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Checkout feature head
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_SHA }}
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: . -> target
-          key: session-persistence-${{ matrix.os }}
-
-      - name: Test Session V2 persistence
-        run: cargo test -p rioterm session::tests -- --nocapture
-
-      - name: Verify session scrollback round trip
-        run: cargo test -p rio-vt scrollback_ansi_round_trip
-
-  build-windows:
-    name: Build Windows x64
-    needs: test-windows
-    runs-on: windows-2025
-
-    steps:
-      - name: Checkout feature head
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_SHA }}
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: . -> target
-
-      - name: Build Rio release binary
-        run: cargo build --release -p rioterm
-
-      - name: Package unsigned portable build
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          New-Item -ItemType Directory -Force -Path package | Out-Null
-
-          Copy-Item target/release/rio.exe package/rio.exe
-          Copy-Item LICENSE package/LICENSE
-          Copy-Item README.md package/README.md
-
-          Compress-Archive -Path package/* -DestinationPath dist/rio-session-restore-windows-x86_64.zip -Force
-          Copy-Item target/release/rio.exe dist/rio-session-restore-windows-x86_64.exe
-
-          $zipHash = (Get-FileHash dist/rio-session-restore-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
-          $exeHash = (Get-FileHash dist/rio-session-restore-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
-          @(
-            "$zipHash  rio-session-restore-windows-x86_64.zip",
-            "$exeHash  rio-session-restore-windows-x86_64.exe"
-          ) | Set-Content -Encoding ascii dist/SHA256SUMS.txt
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rio-session-restore-windows-x86_64
-          path: dist/*
-          if-no-files-found: error
-
-  publish-release:
-    name: Publish rolling prerelease
-    needs: build-windows
+  cleanup-pebrel-cwd:
+    name: Remove duplicate Pebrel CWD path
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout feature head
+      - name: Checkout session-restore
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_SHA }}
+          ref: session-restore
           fetch-depth: 0
 
-      - name: Download Windows build
-        uses: actions/download-artifact@v4
-        with:
-          name: rio-session-restore-windows-x86_64
-          path: dist
-
-      - name: Publish Windows Session V2 previews
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Restore original CWD inheritance and keep main merge
         shell: bash
         run: |
           set -euo pipefail
-          SHORT_SHA="${RELEASE_SHA::7}"
+          python3 <<'PY'
+          import subprocess
+          from pathlib import Path
 
+          PRE = "0fdde0f52fbd43aca42476629e7bb2c7ec4b37a3"
+          BASE = "c04e48d020f891f4f46b0be05f5326a561b719db"
+
+          def git_show(ref: str, path: str) -> str:
+              return subprocess.check_output(["git", "show", f"{ref}:{path}"], text=True)
+
+          def fn_span(text: str, name: str):
+              marker = f"    pub fn {name}("
+              start = text.index(marker)
+              brace = text.index("{", start)
+              depth = 0
+              for i in range(brace, len(text)):
+                  if text[i] == "{":
+                      depth += 1
+                  elif text[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return start, i + 1
+              raise RuntimeError(f"unterminated function {name}")
+
+          def restore_function(path: str, name: str):
+              p = Path(path)
+              cur = p.read_text()
+              old = git_show(PRE, path)
+              cs, ce = fn_span(cur, name)
+              os, oe = fn_span(old, name)
+              p.write_text(cur[:cs] + old[os:oe] + cur[ce:])
+
+          context_path = "frontends/rioterm/src/context/mod.rs"
+          context_file = Path(context_path)
+          context = context_file.read_text()
+          helper_start = context.index(
+              "    /// Resolve the startup directory for a child pane/window from the focused\n"
+          )
+          helper_end = context.index("    pub fn split(", helper_start)
+          context_file.write_text(context[:helper_start] + context[helper_end:])
+          restore_function(context_path, "split")
+          restore_function(context_path, "add_context")
+          restore_function(context_path, "create_new_window")
+
+          event_path = Path("rio-vt/src/event/mod.rs")
+          event = event_path.read_text()
+          assert event.count("CreateWindow(Option<String>)") == 1
+          assert event.count("RioEvent::CreateWindow(_)") == 1
+          event = event.replace("CreateWindow(Option<String>)", "CreateWindow")
+          event = event.replace("RioEvent::CreateWindow(_)", "RioEvent::CreateWindow")
+          event_path.write_text(event)
+
+          app_path = Path("frontends/rioterm/src/application.rs")
+          app = app_path.read_text()
+          old_arm = '''            RioEventType::Rio(RioEvent::CreateWindow(working_dir)) => {
+                let mut config = self.config.clone();
+                if let Some(working_dir) = working_dir {
+                    config.working_dir = Some(working_dir);
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        // The fork PTY path has no working-directory parameter.
+                        config.use_fork = false;
+                    }
+                }
+                self.router.create_window(
+                    event_loop,
+                    self.event_proxy.clone(),
+                    &config,
+                    None,
+                    self.app_id.as_deref(),
+                );
+            }
+'''
+          new_arm = '''            RioEventType::Rio(RioEvent::CreateWindow) => {
+                self.router.create_window(
+                    event_loop,
+                    self.event_proxy.clone(),
+                    &self.config,
+                    None,
+                    self.app_id.as_deref(),
+                );
+            }
+'''
+          assert app.count(old_arm) == 1
+          app_path.write_text(app.replace(old_arm, new_arm))
+
+          readme_path = Path("README.md")
+          readme = readme_path.read_text()
+          assert readme.count("Windows new-window/new-tab/split CWD inheritance supports Nushell OSC 9;9.") == 1
+          readme_path.write_text(readme.replace(
+              "Windows new-window/new-tab/split CWD inheritance supports Nushell OSC 9;9.",
+              "Windows split/new-tab CWD inheritance supports Nushell OSC 9;9.",
+          ))
+
+          # Restore the normal preview workflow exactly as it was before this
+          # one-shot execution. Its release-note wording is adjusted afterward
+          # by a normal user-authored commit so the final preview run triggers.
+          Path(".github/workflows/session-restore-windows-release.yml").write_text(
+              git_show(BASE, ".github/workflows/session-restore-windows-release.yml")
+          )
+          PY
+
+          rm -f .github/workflows/revert-pebrel-cwd-once.yml
+          cargo fmt --all -- --check
+          git diff --check
+
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          cat > release-notes.md <<EOF
-          Windows x64 preview build of Rio from the merged \`session-restore\` branch.
-
-          Commit: \`$RELEASE_SHA\`
-          Branch: \`session-restore\`
-
-          Highlights:
-          - Session V2 workspace restore across windows, tabs and splits
-          - per-pane launch command and current working directory restore
-          - Windows current-pane CWD inheritance for new windows, tabs and splits
-          - Nushell OSC 9;9 current-directory support
-          - optional scrollback persistence
-
-          Session persistence is regression-tested on GitHub Windows Server 2022 and 2025 before packaging.
-          This is an unsigned preview build. Windows may show a SmartScreen warning.
-
-          Assets:
-          - \`rio-session-restore-windows-x86_64.zip\` — portable package
-          - \`rio-session-restore-windows-x86_64.exe\` — raw executable
-          - \`SHA256SUMS.txt\` — checksums
-          EOF
-
-          publish_preview() {
-            TAG="$1"
-            TITLE="$2"
-
-            git tag -f "$TAG" "$RELEASE_SHA"
-            git push --force origin "refs/tags/$TAG"
-
-            if gh release view "$TAG" >/dev/null 2>&1; then
-              gh release edit "$TAG" \
-                --title "$TITLE ($SHORT_SHA)" \
-                --notes-file release-notes.md \
-                --prerelease
-            else
-              gh release create "$TAG" \
-                --target "$RELEASE_SHA" \
-                --title "$TITLE ($SHORT_SHA)" \
-                --notes-file release-notes.md \
-                --prerelease
-            fi
-
-            gh release upload "$TAG" dist/* --clobber
-          }
-
-          # Canonical preview advertised in README.
-          publish_preview "windows-current-pane-cwd-preview" "Rio Windows Session V2 Preview"
-          # Keep the previous rolling tag working for existing users/bookmarks.
-          publish_preview "session-restore-preview" "Rio Session Restore Preview"
+          git add -A
+          git commit -m "revert: drop duplicate Pebrel cwd inheritance"
+          git push origin HEAD:session-restore
