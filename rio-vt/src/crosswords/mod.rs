@@ -10607,8 +10607,8 @@ mod tests {
                     norm(cb),
                     "text mismatch at ({line},{col}): {ca:?} vs {cb:?}"
                 );
-                let sa = cw.grid.style_set.get(a.style_id());
-                let sb = replayed.grid.style_set.get(b.style_id());
+                let sa = cw.grid.style_of(a);
+                let sb = replayed.grid.style_of(b);
                 if !a.is_bg_only() && !b.is_bg_only() && norm(ca) != ' ' {
                     assert_eq!(sa, sb, "style mismatch at ({line},{col})");
                 }
@@ -10620,7 +10620,7 @@ mod tests {
         let has_bg = if bg_cell.is_bg_only() {
             true
         } else {
-            replayed.grid.style_set.get(bg_cell.style_id()).bg
+            replayed.grid.style_of(&bg_cell).bg
                 != crate::crosswords::style::Style::default().bg
         };
         assert!(has_bg, "blue background lost in round trip");
