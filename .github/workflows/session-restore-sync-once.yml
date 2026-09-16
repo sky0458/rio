@@ -1,4 +1,4 @@
-name: Session restore sync once
+name: Session Restore Sync Once
 
 on:
   push:
@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   sync-main:
-    if: github.event.head_commit.message == 'chore: run one-shot main sync'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout session-restore
@@ -25,11 +24,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "main is already an ancestor of session-restore"
+            exit 0
+          fi
           git merge --no-ff -X ours origin/main -m "chore: merge main into session-restore"
-
-      - name: Check rioterm
-        run: cargo check -p rioterm
-
-      - name: Push merged session branch
-        shell: bash
-        run: git push origin HEAD:session-restore
+          cargo check -p rioterm
+          git push origin HEAD:session-restore
