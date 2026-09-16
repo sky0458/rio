@@ -73,15 +73,38 @@ pub struct Screen<'screen> {
     pub renderer: Renderer,
     pub sugarloaf: Sugarloaf<'screen>,
     pub context_manager: context::ContextManager<EventProxy>,
-    last_ime_cursor_pos: Option<(f32, f32)>,
+    /// IME state is per window, not per context: the platform IME
+    /// composes into whichever context is current, and exactly one
+    /// composition can exist per view. Keeping it here (instead of on
+    /// `Context`) makes a stale preedit on a background tab or split
+    /// structurally impossible.
+    pub ime: crate::ime::Ime,
+    /// Screen row the preedit rendered on last frame, so the row can
+    /// be rebuilt when the composition moves or ends even when
+    /// terminal damage reports nothing.
+    last_preedit_row: Option<usize>,
+    last_ime_cursor_pos: Option<(f32, f32, f32)>,
     hints_config: Vec<std::rc::Rc<rio_backend::config::hints::Hint>>,
+    /// Hint regexes compiled on first use, keyed by pattern. Hover
+    /// hit-testing runs on every mouse move; recompiling the URL
+    /// pattern each time is measurable jank.
+    hint_regex_cache:
+        std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<onig::Regex>>>,
+    /// The viewport cell and modifiers of the last hover-hint probe
+    /// that found nothing. Mouse events arrive per pixel; re-probing
+    /// the same cell would re-extract and re-scan the logical line for
+    /// every one of them. Viewport coordinates so the check needs no
+    /// terminal lock, and only an unchanged probe that was not over a
+    /// link is skippable, so text changing under a shown underline
+    /// still refreshes it. Reset on wheel scroll and highlight clears.
+    last_hint_probe: Option<(Pos, rio_window::keyboard::ModifiersState)>,
     pub resize_state: Option<crate::layout::ResizeState>,
     #[cfg(target_os = "macos")]
     pub allow_manual_dragging: bool,
     last_chrome_press: Option<ChromePress>,
     last_close_press: Option<(std::time::Instant, f32)>,
     pub grids: rustc_hash::FxHashMap<usize, rio_backend::sugarloaf::grid::GridRenderer>,
-    pub grid_rasterizer: crate::grid_emit::GridGlyphRasterizer,
+    pub grid_rasterizer: rio_grid::GridGlyphRasterizer,
 }
 
 pub struct ChromePress {
@@ -152,26 +175,32 @@ impl Screen<'_> {
         let backend = if config.renderer.use_cpu {
             SugarloafBackend::Cpu
         } else {
+            // `wgpu_backend` (see build.rs): rioterm's own `wgpu`
+            // feature, or Windows, where sugarloaf and rio-backend get
+            // the feature through the target-specific dependency
+            // override so the wgpu code paths always exist. Without the
+            // Windows half, default builds there silently fall back to
+            // the CPU rasterizer.
             match config.renderer.backend {
                 // `Backend::Vulkan` from the user config means the
                 // native ash backend on Linux. Other OSes fall through
-                // to the wgpu Vulkan path when the `wgpu` feature is
-                // on; otherwise we degrade to CPU rasterizer.
+                // to the wgpu Vulkan path when wgpu is available;
+                // otherwise we degrade to CPU rasterizer.
                 #[cfg(target_os = "linux")]
                 Backend::Vulkan => SugarloafBackend::Vulkan,
-                #[cfg(all(not(target_os = "linux"), feature = "wgpu"))]
+                #[cfg(all(not(target_os = "linux"), wgpu_backend))]
                 Backend::Vulkan => SugarloafBackend::Wgpu(wgpu::Backends::VULKAN),
-                #[cfg(all(not(target_os = "linux"), not(feature = "wgpu")))]
+                #[cfg(all(not(target_os = "linux"), not(wgpu_backend)))]
                 Backend::Vulkan => SugarloafBackend::Cpu,
                 #[cfg(target_os = "macos")]
                 Backend::Metal => SugarloafBackend::Metal,
-                #[cfg(all(feature = "wgpu", target_arch = "wasm32"))]
+                #[cfg(all(wgpu_backend, target_arch = "wasm32"))]
                 Backend::Webgpu => SugarloafBackend::Wgpu(
                     wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
                 ),
-                #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+                #[cfg(all(wgpu_backend, not(target_arch = "wasm32")))]
                 Backend::Webgpu => SugarloafBackend::Wgpu(wgpu::Backends::all()),
-                #[cfg(not(feature = "wgpu"))]
+                #[cfg(not(wgpu_backend))]
                 Backend::Webgpu => SugarloafBackend::Cpu,
             }
         };
@@ -180,6 +209,12 @@ impl Screen<'_> {
             backend,
             font_features: config.fonts.features.clone(),
             colorspace: config.window.colorspace.to_sugarloaf_colorspace(),
+            // The exact predicate the rest of the frontend uses: glass
+            // blur forces the window bg alpha to 0 regardless of opacity,
+            // so it needs an alpha-carrying surface exactly like
+            // `window.opacity < 1` does. Fixed at surface creation; a
+            // live-reloaded opacity change takes effect on restart.
+            prefer_alpha_capable_adapter: !window_should_be_opaque(config),
         };
 
         let mut sugarloaf: Sugarloaf = match Sugarloaf::new(
@@ -195,7 +230,7 @@ impl Screen<'_> {
             }
         };
 
-        #[cfg(feature = "wgpu")]
+        #[cfg(wgpu_backend)]
         sugarloaf.update_filters(config.renderer.filters.as_slice());
 
         let mut renderer = Renderer::new(config);
@@ -263,9 +298,7 @@ impl Screen<'_> {
 
         let cursor = Cursor {
             content: config.cursor.shape.into(),
-            content_ref: config.cursor.shape.into(),
             state: CursorState::new(config.cursor.shape.into()),
-            is_ime_enabled: false,
         };
 
         let context_manager = context::ContextManager::start(
@@ -304,9 +337,13 @@ impl Screen<'_> {
                 .iter()
                 .map(|h| std::rc::Rc::new(h.clone()))
                 .collect(),
+            hint_regex_cache: Default::default(),
+            last_hint_probe: None,
             mouse_bindings: crate::bindings::default_mouse_bindings(),
             modifiers: Modifiers::default(),
             context_manager,
+            ime: crate::ime::Ime::new(),
+            last_preedit_row: None,
             sugarloaf,
             mouse: Mouse::new(config.scroll.multiplier, config.scroll.divider),
             touchpurpose: TouchPurpose::default(),
@@ -319,7 +356,7 @@ impl Screen<'_> {
             last_chrome_press: None,
             last_close_press: None,
             grids: rustc_hash::FxHashMap::default(),
-            grid_rasterizer: crate::grid_emit::GridGlyphRasterizer::new(),
+            grid_rasterizer: rio_grid::GridGlyphRasterizer::new(),
         })
     }
 
@@ -355,6 +392,68 @@ impl Screen<'_> {
             .renderable_content
             .pending_update
             .set_dirty();
+    }
+
+    /// Window-level IME preedit update, with the side effects composing
+    /// implies. Returns whether a repaint is needed.
+    ///
+    /// Composing always snaps out of scrollback: the overlay renders
+    /// only at `display_offset == 0` while the preedit key gate
+    /// swallows input, so a scrolled viewport would mean a live but
+    /// invisible composition and a terminal that looks frozen. This
+    /// holds during search too; the snap composes with the relative
+    /// `Scroll::Delta` restore in `search_reset_state` exactly like a
+    /// manual mid-search scroll does, and committing the query re-runs
+    /// `goto_match`, which scrolls back to the focused match. The snap
+    /// runs on every composition event, not only on changes: candidate
+    /// paging re-reports identical text, and that event must still
+    /// restore visibility after a mid-composition scroll.
+    ///
+    /// Selection follows what the equivalent plain typing does: plain
+    /// input drops it (`send_bytes`), search typing drops it only
+    /// outside vi mode (`search_input` keeps a vi visual selection).
+    pub fn set_ime_preedit(&mut self, preedit: Option<crate::ime::Preedit>) -> bool {
+        let composing = preedit.is_some();
+        let changed = self.ime.preedit() != preedit.as_ref();
+        if changed {
+            self.ime.set_preedit(preedit);
+        }
+
+        let mut needs_render = changed;
+        if composing {
+            let mut terminal = self.ctx_mut().current_mut().terminal.lock();
+            let snapped_offset = terminal.display_offset();
+            if snapped_offset != 0 {
+                terminal.scroll_display(Scroll::Bottom);
+                needs_render = true;
+            }
+            drop(terminal);
+            if snapped_offset != 0 && self.search_active() {
+                // Keep the vi-origin restore honest: `search_reset_state`
+                // applies a relative `Scroll::Delta`, so the snap's
+                // displacement must be recorded the way `goto_match`
+                // records its own scrolls, or Esc after composing lands
+                // the viewport clamped at the bottom instead of at the
+                // vi origin.
+                self.search_state.display_offset_delta += snapped_offset as i32;
+            }
+
+            if changed {
+                if self.search_active() {
+                    if !self.get_mode().contains(Mode::VI) {
+                        // Clear selection so we do not obstruct any matches.
+                        self.context_manager.current_mut().set_selection(None);
+                    }
+                } else {
+                    self.clear_selection();
+                }
+            }
+        }
+
+        if changed {
+            self.mark_dirty();
+        }
+        needs_render
     }
 
     #[inline]
@@ -441,7 +540,10 @@ impl Screen<'_> {
         s.font_size = config.fonts.size;
         s.line_height = config.line_height;
 
-        #[cfg(feature = "wgpu")]
+        // `wgpu_backend`, not the bare feature: default Windows builds
+        // run the wgpu path too, and skipping this made `[renderer]
+        // filters` edits require a restart there.
+        #[cfg(wgpu_backend)]
         self.sugarloaf
             .update_filters(config.renderer.filters.as_slice());
 
@@ -701,7 +803,7 @@ impl Screen<'_> {
         key: &rio_window::event::KeyEvent,
         clipboard: &mut Clipboard,
     ) {
-        if self.context_manager.current().ime.preedit().is_some() {
+        if self.ime.preedit().is_some() {
             return;
         }
 
@@ -1206,7 +1308,8 @@ impl Screen<'_> {
                         if self.ctx().len() <= 1 {
                             return true;
                         }
-                        self.context_manager.close_unfocused_tabs();
+                        self.context_manager
+                            .close_unfocused_tabs(&mut self.sugarloaf);
                         if let Some(ref mut island) = self.renderer.island {
                             island.dismiss_color_picker();
                         }
@@ -1977,18 +2080,53 @@ impl Screen<'_> {
             return self.clear_highlighted_hint();
         }
 
+        let mods = self.modifiers.state();
+
+        // Mouse events arrive per pixel; when the last probe of this
+        // viewport cell with these modifiers found nothing, there is
+        // nothing new to learn until one of them changes. The cell is
+        // pure geometry, so an unchanged probe skips without even
+        // taking the terminal lock. While a highlight is shown the
+        // probe always reruns, so text changing under the underline
+        // still refreshes it. Wheel scrolling resets the probe in
+        // `Self::scroll`; content sliding under a stationary cursor
+        // without one is stale until the mouse crosses a cell.
+        let viewport_point = self.mouse_position(0);
+        if !had_highlight && self.last_hint_probe == Some((viewport_point, mods)) {
+            return false;
+        }
+
         let terminal = self.context_manager.current().terminal.lock();
         let display_offset = terminal.display_offset();
-        let mouse_point = self.mouse_position(display_offset);
+        let mouse_point =
+            Pos::new(viewport_point.row - display_offset, viewport_point.col);
 
         // Find hint at mouse position
-        let highlighted_hint =
-            self.find_hint_at_point(&terminal, mouse_point, self.modifiers.state());
+        let highlighted_hint = self.find_hint_at_point(&terminal, mouse_point, mods);
         drop(terminal);
+        self.last_hint_probe = Some((viewport_point, mods));
 
         let current = self.context_manager.current_mut();
 
         if let Some(hint_match) = highlighted_hint {
+            // Reprobes run on every mouse event while a highlight is
+            // shown (so text changing under it refreshes); when the
+            // match is the same one already displayed there is nothing
+            // to redraw, and re-marking full damage per pixel would
+            // rebuild the grid for the whole hover.
+            let unchanged = current
+                .renderable_content
+                .highlighted_hint
+                .as_ref()
+                .is_some_and(|shown| {
+                    shown.start == hint_match.start
+                        && shown.end == hint_match.end
+                        && shown.text == hint_match.text
+                });
+            if unchanged {
+                return false;
+            }
+
             // Mark the hint range as damaged so it gets re-rendered.
             //
             // Two damage signals are required:
@@ -2035,8 +2173,11 @@ impl Screen<'_> {
     }
 
     /// Drop any hint highlight, clearing its damage so the line
-    /// repaints. Returns whether a highlight existed.
+    /// repaints. Returns whether a highlight existed. Also forgets the
+    /// last probed cell: clears run on context switches, where a stale
+    /// probe could suppress the first probe of the new panel.
     pub fn clear_highlighted_hint(&mut self) -> bool {
+        self.last_hint_probe = None;
         let current = self.context_manager.current_mut();
         let had_highlight = current.renderable_content.highlighted_hint.is_some();
 
@@ -2082,6 +2223,11 @@ impl Screen<'_> {
         point: rio_backend::crosswords::pos::Pos,
         _modifiers: rio_window::keyboard::ModifiersState,
     ) -> Option<crate::hints::HintMatch> {
+        // The logical line under the point is rule-independent:
+        // extracted lazily on the first regex rule, then shared across
+        // the remaining rules.
+        let mut logical_line: Option<Option<crate::hints::LogicalLine>> = None;
+
         // Check each enabled hint configuration
         for hint_config in &self.hints_config {
             // Check if mouse highlighting is enabled for this hint
@@ -2105,14 +2251,24 @@ impl Screen<'_> {
 
             // Check regex patterns if specified
             if let Some(regex_pattern) = &hint_config.regex {
-                if let Ok(regex) = onig::Regex::new(regex_pattern) {
-                    if let Some(regex_match) = self.find_regex_match_at_point(
-                        terminal,
-                        point,
-                        &regex,
-                        hint_config.clone(),
-                    ) {
-                        return Some(regex_match);
+                if let Some(regex) = self.compiled_hint_regex(regex_pattern) {
+                    let line = logical_line.get_or_insert_with(|| {
+                        crate::hints::LogicalLine::extract(terminal, point)
+                    });
+                    if let Some(m) = line.as_ref().and_then(|line| {
+                        line.match_at(
+                            terminal,
+                            point,
+                            &regex,
+                            hint_config.post_processing,
+                        )
+                    }) {
+                        return Some(crate::hints::HintMatch {
+                            text: m.text,
+                            start: m.start,
+                            end: m.end,
+                            hint: hint_config.clone(),
+                        });
                     }
                 }
             }
@@ -2190,77 +2346,19 @@ impl Screen<'_> {
         })
     }
 
-    /// Find regex match at the specified point
-    fn find_regex_match_at_point(
-        &self,
-        terminal: &rio_backend::crosswords::Crosswords<EventProxy>,
-        point: rio_backend::crosswords::pos::Pos,
-        regex: &onig::Regex,
-        hint_config: std::rc::Rc<rio_backend::config::hints::Hint>,
-    ) -> Option<crate::hints::HintMatch> {
-        let grid = &terminal.grid;
-
-        // Check if the point is within grid bounds
-        if point.row >= grid.total_lines() as i32 || point.col.0 >= grid.columns() {
-            return None;
+    /// Compiled regex for a hint pattern, from the cache when possible.
+    /// A pattern that fails to compile is cached as absent implicitly:
+    /// the failed compile repeats, but invalid patterns are a config
+    /// error and rare.
+    fn compiled_hint_regex(&self, pattern: &str) -> Option<std::rc::Rc<onig::Regex>> {
+        if let Some(regex) = self.hint_regex_cache.borrow().get(pattern) {
+            return Some(regex.clone());
         }
-
-        // Extract text from the line
-        let mut line_text = String::new();
-        for col in 0..grid.columns() {
-            let cell = &grid[point.row][rio_backend::crosswords::pos::Column(col)];
-            line_text.push(cell.c());
-        }
-        let line_text = line_text.trim_end();
-
-        // Find all matches in this line and check if point is within any of them.
-        // Onig yields (byte_start, byte_end); we slice the source ourselves.
-        for (start, end) in regex.find_iter(line_text) {
-            let start_col = rio_backend::crosswords::pos::Column(start);
-            let end_col = rio_backend::crosswords::pos::Column(end.saturating_sub(1));
-
-            // Check if the point is within this match
-            if point.col >= start_col && point.col <= end_col {
-                let original_match_text = line_text[start..end].to_string();
-                let mut match_text = original_match_text.clone();
-
-                // Apply grid-based post-processing
-                let (processed_start, processed_end) = if hint_config.post_processing {
-                    self.hint_post_processing(
-                        terminal,
-                        start_col,
-                        end_col,
-                        rio_backend::crosswords::pos::Line(point.row.0),
-                    )
-                    .unwrap_or((start_col, end_col))
-                } else {
-                    (start_col, end_col)
-                };
-
-                // Extract the processed text
-                if hint_config.post_processing {
-                    let mut processed_text = String::new();
-                    for col in processed_start.0..=processed_end.0 {
-                        let cell =
-                            &grid[point.row][rio_backend::crosswords::pos::Column(col)];
-                        processed_text.push(cell.c());
-                    }
-                    match_text = processed_text.trim_end().to_string();
-                }
-
-                return Some(crate::hints::HintMatch {
-                    text: match_text,
-                    start: rio_backend::crosswords::pos::Pos::new(
-                        point.row,
-                        processed_start,
-                    ),
-                    end: rio_backend::crosswords::pos::Pos::new(point.row, processed_end),
-                    hint: hint_config,
-                });
-            }
-        }
-
-        None
+        let regex = std::rc::Rc::new(onig::Regex::new(pattern).ok()?);
+        self.hint_regex_cache
+            .borrow_mut()
+            .insert(pattern.to_string(), regex.clone());
+        Some(regex)
     }
 
     /// Whether a hint (regex match or OSC 8 link) is currently highlighted
@@ -3518,6 +3616,11 @@ impl Screen<'_> {
 
     #[inline]
     pub fn scroll(&mut self, new_scroll_x_px: f64, new_scroll_y_px: f64) {
+        // Scrolling slides different text under the pointer while the
+        // viewport cell stays the same, so the hover-probe dedup key
+        // must not suppress the next probe.
+        self.last_hint_probe = None;
+
         let dim = self.context_manager.current().dimension.dimension;
         let width = dim.width as f64;
         let height = dim.height as f64;
@@ -3675,7 +3778,8 @@ impl Screen<'_> {
             PaletteAction::TabClose => self.close_tab(clipboard),
             PaletteAction::TabCloseUnfocused => {
                 if self.ctx().len() > 1 {
-                    self.context_manager.close_unfocused_tabs();
+                    self.context_manager
+                        .close_unfocused_tabs(&mut self.sugarloaf);
                     if let Some(ref mut island) = self.renderer.island {
                         island.dismiss_color_picker();
                     }
@@ -3911,7 +4015,7 @@ impl Screen<'_> {
                         rio_backend::crosswords::square::Square,
                     >,
                 >,
-                style_table: Vec<rio_backend::crosswords::style::Style>,
+                row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
                 /// Snapshot of the grid's extras table — needed to hash
                 /// per-cell zero-width combining codepoints into the run
                 /// shape key so cells with the same base codepoint but
@@ -3974,7 +4078,12 @@ impl Screen<'_> {
                     rio_backend::crosswords::pos::Pos,
                 )>,
                 hint_labels: Option<Vec<crate::context::renderable::HintLabel>>,
-                label_style_base: Option<u16>,
+                /// Active IME composition, laid out on the cursor row.
+                /// Only ever `Some` for the active panel with an
+                /// unscrolled viewport: the composition belongs to the
+                /// focused context, and a scrolled viewport has no
+                /// on-screen cursor row to anchor it to.
+                preedit_line: Option<rio_grid::preedit::PreeditLine>,
             }
 
             let (active_key, scaled_margin) = {
@@ -4026,8 +4135,7 @@ impl Screen<'_> {
                 // allocations.
                 let visible_rows =
                     std::mem::take(&mut ctx.renderable_content.visible_rows);
-                let mut style_table =
-                    std::mem::take(&mut ctx.renderable_content.style_table);
+                let row_styles = std::mem::take(&mut ctx.renderable_content.row_styles);
                 let extras = std::mem::take(&mut ctx.renderable_content.extras);
                 let term_colors = ctx.renderable_content.term_colors;
                 let display_offset = ctx.renderable_content.display_offset as i32;
@@ -4067,21 +4175,29 @@ impl Screen<'_> {
                 } else {
                     None
                 };
-                let label_style_base = hint_labels
-                    .as_deref()
-                    .filter(|labels| !labels.is_empty())
-                    .map(|_| {
-                        crate::grid_emit::push_hint_label_styles(
-                            &mut style_table,
-                            self.renderer.named_colors.hint_foreground,
-                            self.renderer.named_colors.hint_background,
-                        )
-                    });
                 let cursor_shape = cursor.state.content;
                 let cursor_blinking = ctx.renderable_content.has_blinking_enabled;
                 let cursor_blink_visible =
                     !cursor_blinking || ctx.renderable_content.is_blinking_cursor_visible;
-                let cursor_preedit = ctx.ime.preedit().is_some();
+                // IME state is window-level (`self.ime`); it renders
+                // on the active panel only, and never over scrollback
+                // (the cursor row is off-viewport there — an anchor
+                // computed from it would paint on history).
+                let preedit_line = if is_active && display_offset == 0 {
+                    self.ime.preedit().and_then(|preedit| {
+                        rio_grid::preedit::PreeditLine::new(
+                            &preedit.text,
+                            preedit.cursor,
+                            (cursor.state.pos.row.0.max(0) as usize)
+                                .min(ctx.renderable_content.screen_lines.max(1) - 1),
+                            cursor.state.pos.col.0,
+                            ctx.renderable_content.columns.max(1),
+                        )
+                    })
+                } else {
+                    None
+                };
+                let cursor_preedit = preedit_line.is_some();
                 // OSC 12 wins; otherwise fall back to the named-color
                 // theme value. `Renderer::color`'s fallback (the
                 // indexed-color List) is not populated for the Cursor
@@ -4099,7 +4215,7 @@ impl Screen<'_> {
                     cell_h,
                     font_px,
                     visible_rows,
-                    style_table,
+                    row_styles,
                     extras,
                     term_colors,
                     cursor_col: cursor.state.pos.col.0 as u16,
@@ -4118,7 +4234,7 @@ impl Screen<'_> {
                     focused_match,
                     hovered_hyperlink,
                     hint_labels,
-                    label_style_base,
+                    preedit_line,
                 });
             }
 
@@ -4190,7 +4306,26 @@ impl Screen<'_> {
                     Vec::with_capacity(cols);
                 let mut fg_scratch: Vec<rio_backend::sugarloaf::grid::CellText> =
                     Vec::with_capacity(cols);
-                let mut hint_scratch: Vec<crate::grid_emit::RowHint> = Vec::new();
+                let mut hint_scratch: Vec<rio_grid::RowHint> = Vec::new();
+
+                let label_styles_pair = rio_grid::hint_label_styles(
+                    self.renderer.named_colors.hint_foreground,
+                    self.renderer.named_colors.hint_background,
+                );
+                let hint_labels_converted: Option<Vec<rio_grid::HintLabel>> = p
+                    .hint_labels
+                    .as_deref()
+                    .filter(|labels| !labels.is_empty())
+                    .map(|labels| {
+                        labels
+                            .iter()
+                            .map(|l| rio_grid::HintLabel {
+                                position: l.position,
+                                label: l.label,
+                                is_first: l.is_first,
+                            })
+                            .collect()
+                    });
 
                 // Small helper: rebuild one row into the grid's
                 // buffers. Closure-style to avoid duplicating the
@@ -4206,18 +4341,19 @@ impl Screen<'_> {
                     |p: &PanelFrame,
                      y: usize,
                      grid: &mut rio_backend::sugarloaf::grid::GridRenderer,
-                     rasterizer: &mut crate::grid_emit::GridGlyphRasterizer| {
+                     rasterizer: &mut rio_grid::GridGlyphRasterizer| {
                         let Some(row) = p.visible_rows.get(y) else {
                             return;
                         };
-                        let style_table = p.style_table.as_slice();
-                        let row_sel = crate::grid_emit::row_selection_for(
+                        let row_styles =
+                            p.row_styles.get(y).map(Vec::as_slice).unwrap_or(&[]);
+                        let row_sel = rio_grid::row_selection_for(
                             p.selection,
                             y,
                             cols,
                             p.display_offset,
                         );
-                        crate::grid_emit::row_hints_for(
+                        rio_grid::row_hints_for(
                             p.hint_matches.as_deref(),
                             p.focused_match.as_ref(),
                             p.hovered_hyperlink,
@@ -4227,33 +4363,46 @@ impl Screen<'_> {
                             &mut hint_scratch,
                         );
                         let label_row;
-                        let row = match (p.hint_labels.as_deref(), p.label_style_base) {
-                            (Some(labels), Some(style_base)) => {
-                                match crate::grid_emit::overlay_hint_labels(
+                        let label_styles;
+                        let (row, row_styles) = match hint_labels_converted.as_deref() {
+                            Some(labels) => {
+                                match rio_grid::overlay_hint_labels(
                                     row,
+                                    row_styles,
                                     labels,
                                     y,
                                     p.display_offset,
-                                    style_base,
+                                    label_styles_pair,
                                     &mut hint_scratch,
                                 ) {
-                                    Some(overlaid) => {
-                                        label_row = overlaid;
-                                        &label_row
+                                    Some((r, styles)) => {
+                                        label_row = r;
+                                        label_styles = styles;
+                                        (&label_row, label_styles.as_slice())
                                     }
-                                    None => row,
+                                    None => (row, row_styles),
                                 }
                             }
-                            _ => row,
+                            None => (row, row_styles),
                         };
-                        crate::grid_emit::build_row_bg(
+                        // Thread the composition only into its own
+                        // row: everything else renders untouched.
+                        let preedit_row =
+                            p.preedit_line.as_ref().filter(|line| line.row == y).map(
+                                |line| rio_grid::PreeditRow {
+                                    line,
+                                    block_bg: rio_grid::normalized_to_u8(p.cursor_color),
+                                },
+                            );
+                        rio_grid::build_row_bg(
                             row,
                             cols,
-                            style_table,
+                            row_styles,
                             renderer_ref,
                             &p.term_colors,
                             row_sel,
                             &hint_scratch,
+                            preedit_row.as_ref(),
                             &mut bg_scratch,
                         );
                         let cursor_col_for_row = if p.cursor_visible
@@ -4264,11 +4413,11 @@ impl Screen<'_> {
                         } else {
                             None
                         };
-                        crate::grid_emit::build_row_fg(
+                        rio_grid::build_row_fg(
                             row,
                             cols,
                             y as u16,
-                            style_table,
+                            row_styles,
                             &p.extras,
                             renderer_ref,
                             &p.term_colors,
@@ -4279,6 +4428,7 @@ impl Screen<'_> {
                             p.cell_h,
                             row_sel,
                             &hint_scratch,
+                            preedit_row.as_ref(),
                             &font_library,
                             p.route_id,
                             cursor_col_for_row,
@@ -4320,6 +4470,29 @@ impl Screen<'_> {
                     }
                 }
 
+                // The composition is painted into the row's CPU
+                // cells, so its row must rebuild whenever the overlay
+                // exists, moved, or just disappeared — even when
+                // terminal damage says nothing changed (the text under
+                // it didn't; the overlay did). Cheap: at most two rows.
+                if p.is_active {
+                    let current = p.preedit_line.as_ref().map(|line| line.row);
+                    for row in [
+                        self.last_preedit_row
+                            .filter(|_| self.last_preedit_row != current),
+                        current,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if row < p.visible_rows.len() {
+                            rebuild_row(p, row, grid, rasterizer);
+                            p.visible_rows[row].dirty = false;
+                        }
+                    }
+                    self.last_preedit_row = current;
+                }
+
                 // Atlas-full recovery: the backend cleared the atlas
                 // during the rebuild above, so rows written before the
                 // clear reference stale slots. Re-emit everything.
@@ -4345,16 +4518,15 @@ impl Screen<'_> {
                 // frame and only dirties cursor buffers on
                 // change — do NOT clear the slots beforehand,
                 // that would dirty them every frame.
-                let render_style = crate::grid_emit::cursor_render_style(
-                    crate::grid_emit::CursorRenderInputs {
+                let render_style =
+                    rio_grid::cursor_render_style(rio_grid::CursorRenderInputs {
                         visible: p.cursor_visible,
                         focused: p.is_active && self.renderer.is_window_focused,
                         blink_visible: p.cursor_blink_visible,
                         blinking: p.cursor_blinking,
                         preedit: p.cursor_preedit,
                         shape: p.cursor_shape,
-                    },
-                );
+                    });
                 let mut block_cursor: Option<rio_backend::sugarloaf::grid::CellText> =
                     None;
                 let mut tail_cursor: Option<rio_backend::sugarloaf::grid::CellText> =
@@ -4368,7 +4540,7 @@ impl Screen<'_> {
                         (p.cursor_color[2].clamp(0.0, 1.0) * 255.0) as u8,
                         255,
                     ];
-                    if let Some((is_block, cell)) = crate::grid_emit::cursor_sprite_cell(
+                    if let Some((is_block, cell)) = rio_grid::cursor_sprite_cell(
                         grid,
                         style,
                         p.cursor_col,
@@ -4408,18 +4580,21 @@ impl Screen<'_> {
                 // underline / hollow) draw via the sprite emitted
                 // above; their bg/text stays untouched. Same gate as
                 // .
-                let (cursor_pos, cursor_col_u, cursor_bg_u) = if matches!(
-                    render_style,
-                    Some(crate::grid_emit::CursorRenderStyle::Block)
-                ) {
-                    (
-                        [p.cursor_col as u32, p.cursor_row as u32],
-                        [bg_col[0], bg_col[1], bg_col[2], bg_col[3]],
-                        [p.cursor_color[0], p.cursor_color[1], p.cursor_color[2], 1.0],
-                    )
-                } else {
-                    ([u32::MAX; 2], [0.0; 4], [0.0; 4])
-                };
+                let (cursor_pos, cursor_col_u, cursor_bg_u) =
+                    if matches!(render_style, Some(rio_grid::CursorRenderStyle::Block)) {
+                        (
+                            [p.cursor_col as u32, p.cursor_row as u32],
+                            [bg_col[0], bg_col[1], bg_col[2], bg_col[3]],
+                            [
+                                p.cursor_color[0],
+                                p.cursor_color[1],
+                                p.cursor_color[2],
+                                1.0,
+                            ],
+                        )
+                    } else {
+                        ([u32::MAX; 2], [0.0; 4], [0.0; 4])
+                    };
 
                 let uniforms = rio_backend::sugarloaf::grid::GridUniforms {
                     projection:
@@ -4489,12 +4664,8 @@ impl Screen<'_> {
                 let route_id = item.val.route_id;
                 if let Some(idx) = panels.iter().position(|p| p.route_id == route_id) {
                     let p = panels.swap_remove(idx);
-                    let mut style_table = p.style_table;
-                    if let Some(base) = p.label_style_base {
-                        style_table.truncate(base as usize);
-                    }
                     item.val.renderable_content.visible_rows = p.visible_rows;
-                    item.val.renderable_content.style_table = style_table;
+                    item.val.renderable_content.row_styles = p.row_styles;
                     item.val.renderable_content.extras = p.extras;
                     item.val.renderable_content.hint_labels = p.hint_labels;
                 }
@@ -4558,6 +4729,39 @@ impl Screen<'_> {
         let layout = current_item.val.dimension;
         let cursor_pos = current_item.val.renderable_content.cursor.state.pos;
 
+        // While composing, the candidate popup follows the IME caret,
+        // not the terminal cursor: the composition renders inline and
+        // can slide away from the cursor cell, and a popup opening
+        // tens of cells from the caret overlaps the freshly drawn
+        // text. The reported area's width spans from the caret to the
+        // composition's end, so the OS also knows how much freshly
+        // drawn text to avoid covering.
+        // Mirrors the layout the renderer uses (same inputs).
+        let content = &current_item.val.renderable_content;
+        let (anchor_row, anchor_col, anchor_cells) =
+            match self.ime.preedit().filter(|_| {
+                content.display_offset == 0
+                    && content.columns > 0
+                    && content.screen_lines > 0
+            }) {
+                Some(preedit) => match rio_grid::preedit::PreeditLine::new(
+                    &preedit.text,
+                    preedit.cursor,
+                    (cursor_pos.row.0.max(0) as usize).min(content.screen_lines - 1),
+                    cursor_pos.col.0,
+                    content.columns,
+                ) {
+                    Some(line) => {
+                        let col = line.popup_anchor_col().min(content.columns - 1);
+                        let cells =
+                            line.end_col().min(content.columns).max(col + 1) - col;
+                        (line.row, col, cells)
+                    }
+                    None => (cursor_pos.row.0.max(0) as usize, cursor_pos.col.0, 1),
+                },
+                None => (cursor_pos.row.0.max(0) as usize, cursor_pos.col.0, 1),
+            };
+
         // Calculate pixel position of cursor — canonical integer
         // stride (line_height already baked into cell_height).
         let cell_width = layout.cell.cell_width as f32;
@@ -4580,9 +4784,8 @@ impl Screen<'_> {
         let origin_y = panel_rect[1] + scaled_margin.top;
 
         // Convert grid position to pixel position
-        let pixel_x =
-            origin_x + (cursor_pos.col.0 as f32 * cell_width) + (cell_width * 0.5);
-        let pixel_y = origin_y + (cursor_pos.row.0 as f32 * cell_height);
+        let pixel_x = origin_x + (anchor_col as f32 * cell_width) + (cell_width * 0.5);
+        let pixel_y = origin_y + (anchor_row as f32 * cell_height);
 
         // Validate final coordinates
         if pixel_x.is_nan() || pixel_y.is_nan() || pixel_x < 0.0 || pixel_y < 0.0 {
@@ -4590,20 +4793,27 @@ impl Screen<'_> {
             return;
         }
 
-        // Check if position has changed significantly to avoid unnecessary updates
-        if let Some((last_x, last_y)) = self.last_ime_cursor_pos {
-            if (pixel_x - last_x).abs() < 1.0 && (pixel_y - last_y).abs() < 1.0 {
-                return; // Position hasn't changed significantly
+        // A PastEnd caret sits one cell past the composition, where
+        // `end_col - col` is 0; the area is always at least one cell.
+        let area_width = anchor_cells as f32 * cell_width;
+
+        // Check if the area changed significantly to avoid unnecessary updates
+        if let Some((last_x, last_y, last_w)) = self.last_ime_cursor_pos {
+            if (pixel_x - last_x).abs() < 1.0
+                && (pixel_y - last_y).abs() < 1.0
+                && (area_width - last_w).abs() < 1.0
+            {
+                return; // Area hasn't changed significantly
             }
         }
 
-        // Update last position
-        self.last_ime_cursor_pos = Some((pixel_x, pixel_y));
+        // Update last area
+        self.last_ime_cursor_pos = Some((pixel_x, pixel_y, area_width));
 
         // Set IME cursor area
         window.set_ime_cursor_area(
             rio_window::dpi::PhysicalPosition::new(pixel_x as f64, pixel_y as f64),
-            rio_window::dpi::PhysicalSize::new(cell_width as f64, cell_height as f64),
+            rio_window::dpi::PhysicalSize::new(area_width as f64, cell_height as f64),
         );
     }
 
@@ -4848,100 +5058,6 @@ impl Screen<'_> {
             .current_mut()
             .renderable_content
             .hint_labels = hint_labels;
-    }
-
-    /// Apply grid-based hint post-processing.
-    ///
-    /// This iterates through the terminal grid character by character and adjusts
-    /// the match bounds based on bracket balance and trailing delimiters.
-    fn hint_post_processing(
-        &self,
-        terminal: &rio_backend::crosswords::Crosswords<EventProxy>,
-        start_col: rio_backend::crosswords::pos::Column,
-        end_col: rio_backend::crosswords::pos::Column,
-        row: rio_backend::crosswords::pos::Line,
-    ) -> Option<(
-        rio_backend::crosswords::pos::Column,
-        rio_backend::crosswords::pos::Column,
-    )> {
-        use rio_backend::crosswords::grid::BidirectionalIterator;
-
-        let grid = &terminal.grid;
-        let start_pos = rio_backend::crosswords::pos::Pos::new(row, start_col);
-        let end_pos = rio_backend::crosswords::pos::Pos::new(row, end_col);
-
-        let mut iter = grid.iter_from(start_pos);
-        let mut current_pos = start_pos;
-        let mut open_parents = 0;
-        let mut open_brackets = 0;
-
-        // First pass: handle uneven brackets/parentheses
-        while current_pos <= end_pos {
-            if let Some(indexed) = iter.next() {
-                let c = indexed.square.c();
-                current_pos = indexed.pos;
-
-                match c {
-                    '(' => open_parents += 1,
-                    '[' => open_brackets += 1,
-                    ')' => {
-                        if open_parents == 0 {
-                            // Unmatched closing parenthesis, truncate here
-                            if iter.prev().is_some() {
-                                return Some((start_col, iter.pos().col));
-                            }
-                            break;
-                        } else {
-                            open_parents -= 1;
-                        }
-                    }
-                    ']' => {
-                        if open_brackets == 0 {
-                            // Unmatched closing bracket, truncate here
-                            if iter.prev().is_some() {
-                                return Some((start_col, iter.pos().col));
-                            }
-                            break;
-                        } else {
-                            open_brackets -= 1;
-                        }
-                    }
-                    _ => (),
-                }
-
-                if current_pos == end_pos {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // Second pass: remove trailing delimiters
-        let mut final_end = end_pos;
-        let mut iter = grid.iter_from(end_pos);
-
-        while final_end > start_pos {
-            if let Some(indexed) = iter.next() {
-                let c = indexed.square.c();
-                if !matches!(c, '.' | ',' | ':' | ';' | '?' | '!' | '(' | '[' | '\'') {
-                    break;
-                }
-
-                if let Some(prev_indexed) = iter.prev() {
-                    final_end = prev_indexed.pos;
-                    if iter.prev().is_some() {
-                        // Move iterator back one more position for next iteration
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        Some((start_col, final_end.col))
     }
 }
 

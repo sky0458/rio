@@ -7,7 +7,6 @@ use crate::context::title::{
 };
 use crate::event::sync::FairMutex;
 use crate::event::{Msg, RioEvent};
-use crate::ime::Ime;
 pub use crate::layout::{ContextDimension, ContextGrid, ContextGridItem};
 use crate::messenger::Messenger;
 use crate::performer::{self, Machine};
@@ -59,7 +58,6 @@ pub struct Context<T: EventListener> {
     pub title: ContextTitle,
     /// Program/arguments actually used to launch this pane.
     pub launch: Shell,
-    pub ime: Ime,
     _io_thread: Option<JoinHandle<(Machine<teletypewriter::Pty, T>, performer::State)>>,
 }
 
@@ -97,9 +95,7 @@ impl<T: EventListener> Context<T> {
     pub fn cursor_from_ref(&self) -> Cursor {
         Cursor {
             state: self.renderable_content.cursor.state.new_from_self(),
-            content: self.renderable_content.cursor.content_ref,
-            content_ref: self.renderable_content.cursor.content_ref,
-            is_ime_enabled: false,
+            content: self.renderable_content.cursor.content,
         }
     }
 }
@@ -175,7 +171,6 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
         dimension,
         title: ContextTitle::default(),
         launch: Shell::default(),
-        ime: Ime::new(),
         _io_thread: None,
     }
 }
@@ -384,7 +379,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             dimension,
             title: ContextTitle::default(),
             launch: config.shell.clone(),
-            ime: Ime::new(),
             _io_thread: io_thread,
         })
     }
@@ -538,7 +532,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
 
         // A whole tab dies.
-        self.contexts[tab_index].remove_all_rich_text(sugarloaf);
+        self.contexts[tab_index].remove_from_sugarloaf(sugarloaf);
         self.contexts.remove(tab_index);
 
         if self.contexts.is_empty() {
@@ -601,8 +595,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn create_new_window(&self) {
-        self.event_proxy
-            .send_event(RioEvent::CreateWindow, self.window_id);
+        self.event_proxy.send_event(
+            RioEvent::CreateWindow(self.focused_working_dir()),
+            self.window_id,
+        );
     }
 
     #[inline]
@@ -612,10 +608,15 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn close_unfocused_tabs(&mut self) {
+    pub fn close_unfocused_tabs(&mut self, sugarloaf: &mut Sugarloaf) {
         let current_route_id = self.current().route_id;
-        self.contexts
-            .retain(|ctx| ctx.current().route_id == current_route_id);
+        self.contexts.retain(|ctx| {
+            let keep = ctx.current().route_id == current_route_id;
+            if !keep {
+                ctx.remove_from_sugarloaf(sugarloaf);
+            }
+            keep
+        });
         self.current_route = self.contexts[0].current().route_id;
         self.set_current(0);
     }
@@ -1070,7 +1071,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
 
         // Remove all rich text from the grid before removing the context
-        self.contexts[index_to_remove].remove_all_rich_text(sugarloaf);
+        self.contexts[index_to_remove].remove_from_sugarloaf(sugarloaf);
         self.contexts.remove(index_to_remove);
 
         if should_set_current {
@@ -1176,33 +1177,46 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.set_current(target);
     }
 
+    /// Resolve the startup directory for a child pane/window from the focused
+    /// terminal. Dynamic terminal reports are trusted only when absolute and
+    /// free of control characters; otherwise the configured directory wins.
+    fn focused_working_dir(&self) -> Option<String> {
+        if !self.config.cwd {
+            return self.config.working_dir.clone();
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        let reported = {
+            let current = self.current();
+            teletypewriter::foreground_process_path(*current.main_fd, current.shell_pid)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        };
+
+        #[cfg(target_os = "windows")]
+        let reported = self
+            .current()
+            .terminal
+            .lock()
+            .current_directory
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+
+        reported
+            .filter(|cwd| {
+                std::path::Path::new(cwd).is_absolute()
+                    && !cwd.chars().any(char::is_control)
+            })
+            .or_else(|| self.config.working_dir.clone())
+    }
+
     pub fn split(
         &mut self,
         rich_text_id: usize,
         split_down: bool,
         sugarloaf: &mut Sugarloaf,
     ) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                let tracked = self.current().terminal.lock().current_directory.clone();
-                if let Some(path) = tracked {
-                    working_dir = Some(path.to_string_lossy().into_owned());
-                }
-            }
-        }
+        let working_dir = self.focused_working_dir();
 
         let mut cloned_config = self.config.clone();
         if working_dir.is_some() {
@@ -1301,27 +1315,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                let tracked = self.current().terminal.lock().current_directory.clone();
-                if let Some(path) = tracked {
-                    working_dir = Some(path.to_string_lossy().into_owned());
-                }
-            }
-        }
+        let working_dir = self.focused_working_dir();
 
         if self.config.is_native {
             self.event_proxy

@@ -1,3 +1,11 @@
+/// The input policy every overlay text sink applies, in ONE place so
+/// the key path and the IME commit path can never drift: non-empty and
+/// free of control characters.
+#[inline]
+pub(crate) fn is_printable_text(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| !c.is_control())
+}
+
 pub mod assistant;
 pub mod command_palette;
 pub mod confirm_quit;
@@ -141,7 +149,7 @@ fn window_bg_alpha(config: &Config) -> f32 {
     }
 }
 
-pub use rio_backend::sugarloaf::{atlas_image_key, kitty_image_key};
+pub use rio_backend::sugarloaf::{atlas_image_key, kitty_image_key, route_image_key};
 
 pub struct Renderer {
     is_vi_mode_enabled: bool,
@@ -459,21 +467,6 @@ impl Renderer {
             let panel_rect = grid_context.layout_rect;
             let context = grid_context.context_mut();
 
-            let mut has_ime = false;
-            if let Some(preedit) = context.ime.preedit() {
-                if let Some(content) = preedit.text.chars().next() {
-                    context.renderable_content.cursor.content = content;
-                    context.renderable_content.cursor.is_ime_enabled = true;
-                    has_ime = true;
-                }
-            }
-
-            if !has_ime {
-                context.renderable_content.cursor.is_ime_enabled = false;
-                context.renderable_content.cursor.content =
-                    context.renderable_content.cursor.content_ref;
-            }
-
             let force_full_damage = has_active_changed || self.is_game_mode_enabled;
 
             let is_dirty = context.renderable_content.pending_update.is_dirty();
@@ -521,17 +514,15 @@ impl Renderer {
 
                 terminal.reset_damage();
 
-                let snapshot_cols = terminal.columns();
                 terminal.snapshot_visible(
                     &damage,
-                    snapshot_cols,
                     &mut context.renderable_content.visible_rows,
-                    &mut context.renderable_content.style_table,
+                    &mut context.renderable_content.row_styles,
                     &mut context.renderable_content.extras,
                 );
                 context.renderable_content.term_colors = terminal.colors;
                 context.renderable_content.display_offset = terminal.display_offset();
-                context.renderable_content.columns = snapshot_cols;
+                context.renderable_content.columns = terminal.columns();
                 context.renderable_content.screen_lines = terminal.screen_lines();
                 context.renderable_content.history_size = terminal.history_size();
                 context.renderable_content.lines_evicted = terminal.lines_evicted();
@@ -574,6 +565,7 @@ impl Renderer {
             // exist. Positions depend on display_offset and history_size which
             // change on scroll and text output (like approach).
             let rc = &context.renderable_content;
+            let route_id = context.route_id;
             let has_overlays = !rc.kitty_placements.is_empty();
             let has_virtual = !rc.kitty_virtual_placements.is_empty();
             let has_atlas = !rc.atlas_placements.is_empty();
@@ -629,7 +621,7 @@ impl Renderer {
                             continue;
                         };
                         let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
-                            image_id: p.image_key,
+                            image_id: route_image_key(route_id, p.image_key),
                             x: geometry.x,
                             y: geometry.y,
                             width: geometry.width,
@@ -667,7 +659,10 @@ impl Renderer {
                             continue;
                         };
                         let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
-                            image_id: kitty_image_key(p.image_id),
+                            image_id: route_image_key(
+                                route_id,
+                                kitty_image_key(p.image_id),
+                            ),
                             x: geometry.x,
                             y: geometry.y,
                             width: geometry.width,
@@ -691,6 +686,7 @@ impl Renderer {
                     Self::push_virtual_placeholder_overlays(
                         overlays,
                         rc,
+                        route_id,
                         origin_x,
                         origin_y,
                         cell_width,
@@ -981,6 +977,7 @@ impl Renderer {
     fn push_virtual_placeholder_overlays(
         overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
         rc: &RenderableContent,
+        route_id: usize,
         origin_x: f32,
         origin_y: f32,
         cell_width: f32,
@@ -1008,6 +1005,11 @@ impl Renderer {
             // discontinuity, etc.) we flush the run as one overlay and
             // start a new one. Mirrors `PlacementIterator.next`.
             let mut run: Option<(IncompletePlacement, usize)> = None;
+            let row_styles = rc
+                .row_styles
+                .get(line_idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
 
             for (col_idx, square) in row.inner.iter().enumerate() {
                 if square.c() != PLACEHOLDER {
@@ -1015,6 +1017,7 @@ impl Renderer {
                         flush_run(
                             overlays,
                             rc,
+                            route_id,
                             p.complete(),
                             line_idx,
                             start_col,
@@ -1029,7 +1032,7 @@ impl Renderer {
                     continue;
                 }
 
-                let style = crate::grid_emit::resolve_style(&rc.style_table, *square);
+                let style = rio_grid::resolve_style(row_styles, col_idx);
                 let combining: &[char] = square
                     .extras_id()
                     .and_then(|eid| rc.extras.get(&eid))
@@ -1051,6 +1054,7 @@ impl Renderer {
                             flush_run(
                                 overlays,
                                 rc,
+                                route_id,
                                 p.complete(),
                                 line_idx,
                                 start_col,
@@ -1081,6 +1085,7 @@ impl Renderer {
                 flush_run(
                     overlays,
                     rc,
+                    route_id,
                     p.complete(),
                     line_idx,
                     start_col,
@@ -1104,6 +1109,7 @@ impl Renderer {
         fn flush_run(
             overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
             rc: &RenderableContent,
+            route_id: usize,
             run: PlaceholderRun,
             screen_line: usize,
             start_screen_col: usize,
@@ -1114,10 +1120,11 @@ impl Renderer {
             z_index: i32,
             clip: (f32, f32, f32, f32),
         ) {
-            let vp = rc
-                .kitty_virtual_placements
-                .get(&(run.image_id, run.placement_id))
-                .or_else(|| rc.kitty_virtual_placements.get(&(run.image_id, 0)));
+            let vp = rio_backend::ansi::kitty_virtual::resolve_virtual_placement(
+                &rc.kitty_virtual_placements,
+                run.image_id,
+                run.placement_id,
+            );
             let vp = match vp {
                 Some(v) => v,
                 None => return,
@@ -1146,7 +1153,7 @@ impl Renderer {
             };
 
             let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
-                image_id: kitty_image_key(run.image_id),
+                image_id: route_image_key(route_id, kitty_image_key(run.image_id)),
                 x: geom.x,
                 y: geom.y,
                 width: geom.width,
@@ -1164,6 +1171,59 @@ impl Renderer {
                 overlays.push(overlay);
             }
         }
+    }
+}
+
+/// Bridges the frontend `Renderer` to the shared `rio-grid` emit code,
+/// delegating each palette operation to the existing methods/fields.
+impl rio_grid::GridPalette for Renderer {
+    #[inline]
+    fn named_colors(&self) -> &Colors {
+        &self.named_colors
+    }
+
+    #[inline]
+    fn compute_color(
+        &self,
+        color: &AnsiColor,
+        flags: StyleFlags,
+        term_colors: &TermColors,
+    ) -> ColorArray {
+        Renderer::compute_color(self, color, flags, term_colors)
+    }
+
+    #[inline]
+    fn compute_bg_color(
+        &self,
+        cell_style: &CellStyle,
+        term_colors: &TermColors,
+    ) -> ColorArray {
+        Renderer::compute_bg_color(self, cell_style, term_colors)
+    }
+
+    #[inline]
+    fn color(&self, idx: usize, term_colors: &TermColors) -> ColorArray {
+        Renderer::color(self, idx, term_colors)
+    }
+
+    #[inline]
+    fn use_drawable_chars(&self) -> bool {
+        Renderer::use_drawable_chars(self)
+    }
+
+    #[inline]
+    fn opacity_cells(&self) -> bool {
+        self.opacity_cells
+    }
+
+    #[inline]
+    fn cell_bg_alpha(&self) -> u8 {
+        self.cell_bg_alpha
+    }
+
+    #[inline]
+    fn ignore_selection_fg_color(&self) -> bool {
+        self.ignore_selection_fg_color
     }
 }
 
@@ -1349,5 +1409,68 @@ mod hint_tooltip_tests {
     #[test]
     fn multibyte_text_is_sliced_on_char_boundaries() {
         assert_eq!(elide_tail("héllo wörld", 40.0, measure), "hél\u{2026}");
+    }
+}
+
+/// End-to-end guards for `rio_grid::cell_bg` driven through the
+/// `Renderer` palette impl. These moved out of `grid_emit` when it
+/// became the standalone `rio-grid` crate (which can't depend on the
+/// frontend `Renderer`); they live here now that `Renderer` provides
+/// the `GridPalette` the emit code needs.
+#[cfg(test)]
+mod grid_cell_bg_tests {
+    use super::*;
+    use rio_backend::config::colors::ColorRgb;
+    use rio_backend::crosswords::square::Square;
+
+    /// End-to-end guard for the tmux faint-text regression: tmux
+    /// re-emits the pane's OSC 11 as an explicit SGR 48 on every cell,
+    /// so a faint cell arrived as `Spec(bg) + DIM` and was painted at
+    /// `bg * DIM_FACTOR`, a dark block against the field around it.
+    #[test]
+    fn dim_cell_paints_its_explicit_background_unchanged() {
+        let renderer = Renderer::new(&Config::default());
+        let colors = TermColors::default();
+        let sq = Square::from_char('x');
+        let bg = ColorRgb {
+            r: 0x28,
+            g: 0x2c,
+            b: 0x34,
+        };
+        let style = CellStyle {
+            bg: AnsiColor::Spec(bg),
+            ..CellStyle::default()
+        };
+
+        let plain = rio_grid::cell_bg(sq, style, &renderer, &colors);
+        let dimmed = rio_grid::cell_bg(
+            sq,
+            CellStyle {
+                flags: StyleFlags::DIM,
+                ..style
+            },
+            &renderer,
+            &colors,
+        );
+
+        assert_eq!(plain, [0x28, 0x2c, 0x34, 255]);
+        assert_eq!(dimmed, plain);
+    }
+
+    /// A faint cell that never had its background set still paints
+    /// nothing, so window transparency keeps showing through.
+    #[test]
+    fn dim_cell_with_default_background_stays_unpainted() {
+        let renderer = Renderer::new(&Config::default());
+        let colors = TermColors::default();
+        let style = CellStyle {
+            flags: StyleFlags::DIM,
+            ..CellStyle::default()
+        };
+
+        assert_eq!(
+            rio_grid::cell_bg(Square::from_char('x'), style, &renderer, &colors),
+            [0, 0, 0, 0]
+        );
     }
 }
