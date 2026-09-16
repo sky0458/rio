@@ -1,3 +1,4 @@
+# One-shot cleanup runner; deletes itself after applying the patch.
 import subprocess
 from pathlib import Path
 
