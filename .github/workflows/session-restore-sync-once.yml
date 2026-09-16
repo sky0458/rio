@@ -17,12 +17,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfontconfig1-dev glslang-tools
-
-      - name: Merge main without touching main
+      - name: Diagnose main merge conflicts
         shell: bash
         run: |
           set -euo pipefail
@@ -33,12 +28,18 @@ jobs:
             echo "main is already an ancestor of session-restore"
             exit 0
           fi
-          git merge --no-ff -X ours origin/main -m "chore: merge main into session-restore"
-          sed -i 's/self\.grid\.style_set\.get(cell\.style_id())/self.grid.style_of(cell)/' rio-vt/src/crosswords/mod.rs
-          cargo fmt --all
-          cargo check -p rioterm
-          git add rio-vt/src/crosswords/mod.rs
-          if ! git diff --cached --quiet; then
-            git commit -m "fix: adapt session serialization to upstream grid styles"
+          set +e
+          git merge --no-ff --no-commit origin/main
+          rc=$?
+          set -e
+          echo "merge exit code: $rc"
+          git status --short
+          echo "UNMERGED FILES:"
+          git diff --name-only --diff-filter=U
+          if [ "$rc" -ne 0 ]; then
+            echo "CONFLICT DIFF:"
+            git diff --cc
+            exit 1
           fi
+          git commit -m "chore: merge main into session-restore"
           git push origin HEAD:session-restore
