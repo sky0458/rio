@@ -1,0 +1,35 @@
+name: Session restore sync once
+
+on:
+  push:
+    branches:
+      - session-restore
+
+permissions:
+  contents: write
+
+jobs:
+  sync-main:
+    if: github.event.head_commit.message == 'chore: run one-shot main sync'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout session-restore
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge main without touching main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git merge --no-ff -X ours origin/main -m "chore: merge main into session-restore"
+
+      - name: Check rioterm
+        run: cargo check -p rioterm
+
+      - name: Push merged session branch
+        shell: bash
+        run: git push origin HEAD:session-restore
