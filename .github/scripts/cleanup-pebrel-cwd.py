@@ -1,0 +1,110 @@
+import subprocess
+from pathlib import Path
+
+PRE = "0fdde0f52fbd43aca42476629e7bb2c7ec4b37a3"
+BASE = "c04e48d020f891f4f46b0be05f5326a561b719db"
+
+
+def git_show(ref: str, path: str) -> str:
+    return subprocess.check_output(["git", "show", f"{ref}:{path}"], text=True)
+
+
+def fn_span(text: str, name: str):
+    marker = f"    pub fn {name}("
+    start = text.index(marker)
+    brace = text.index("{", start)
+    depth = 0
+    for i in range(brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+    raise RuntimeError(f"unterminated function {name}")
+
+
+def restore_function(path: str, name: str):
+    p = Path(path)
+    cur = p.read_text()
+    old = git_show(PRE, path)
+    cs, ce = fn_span(cur, name)
+    os, oe = fn_span(old, name)
+    p.write_text(cur[:cs] + old[os:oe] + cur[ce:])
+
+
+context_path = "frontends/rioterm/src/context/mod.rs"
+context_file = Path(context_path)
+context = context_file.read_text()
+helper_start = context.index(
+    "    /// Resolve the startup directory for a child pane/window from the focused\n"
+)
+helper_end = context.index("    pub fn split(", helper_start)
+context_file.write_text(context[:helper_start] + context[helper_end:])
+restore_function(context_path, "split")
+restore_function(context_path, "add_context")
+restore_function(context_path, "create_new_window")
+
+event_path = Path("rio-vt/src/event/mod.rs")
+event = event_path.read_text()
+assert event.count("CreateWindow(Option<String>)") == 1
+assert event.count("RioEvent::CreateWindow(_)") == 1
+event = event.replace("CreateWindow(Option<String>)", "CreateWindow")
+event = event.replace("RioEvent::CreateWindow(_)", "RioEvent::CreateWindow")
+event_path.write_text(event)
+
+app_path = Path("frontends/rioterm/src/application.rs")
+app = app_path.read_text()
+old_arm = '''            RioEventType::Rio(RioEvent::CreateWindow(working_dir)) => {
+                let mut config = self.config.clone();
+                if let Some(working_dir) = working_dir {
+                    config.working_dir = Some(working_dir);
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        // The fork PTY path has no working-directory parameter.
+                        config.use_fork = false;
+                    }
+                }
+                self.router.create_window(
+                    event_loop,
+                    self.event_proxy.clone(),
+                    &config,
+                    None,
+                    self.app_id.as_deref(),
+                );
+            }
+'''
+new_arm = '''            RioEventType::Rio(RioEvent::CreateWindow) => {
+                self.router.create_window(
+                    event_loop,
+                    self.event_proxy.clone(),
+                    &self.config,
+                    None,
+                    self.app_id.as_deref(),
+                );
+            }
+'''
+assert app.count(old_arm) == 1
+app_path.write_text(app.replace(old_arm, new_arm))
+
+readme_path = Path("README.md")
+readme = readme_path.read_text()
+assert readme.count(
+    "Windows new-window/new-tab/split CWD inheritance supports Nushell OSC 9;9."
+) == 1
+readme_path.write_text(
+    readme.replace(
+        "Windows new-window/new-tab/split CWD inheritance supports Nushell OSC 9;9.",
+        "Windows split/new-tab CWD inheritance supports Nushell OSC 9;9.",
+    )
+)
+
+# Restore the normal preview workflow exactly as it was before the temporary
+# cleanup wrapper. A normal user-authored follow-up commit updates its note and
+# triggers validation on the final code state.
+Path(".github/workflows/session-restore-windows-release.yml").write_text(
+    git_show(BASE, ".github/workflows/session-restore-windows-release.yml")
+)
+
+Path(".github/scripts/cleanup-pebrel-cwd.py").unlink(missing_ok=True)
+Path(".github/workflows/revert-pebrel-cwd-once.yml").unlink(missing_ok=True)
