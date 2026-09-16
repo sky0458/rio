@@ -35,12 +35,12 @@ jobs:
           fi
           git merge --no-ff --no-commit origin/main || true
           python3 .github/scripts/resolve-session-restore-sync.py
+          git add -A
           if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
             echo "Unresolved merge conflicts remain"
             git diff --name-only --diff-filter=U
             exit 1
           fi
-          git add -A
           cargo fmt --all -- --check
           cargo check -p rioterm
           git commit -m "chore: merge main into session-restore and inherit focused cwd"
