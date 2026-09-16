@@ -34,5 +34,37 @@ jobs:
             exit 0
           fi
           git merge --no-ff -X ours origin/main -m "chore: merge main into session-restore"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("rio-vt/src/crosswords/mod.rs")
+          text = path.read_text()
+          old = '''                let style = if cell.is_bg_only() {
+                    Style {
+                        bg: match cell.content_tag() {
+                            square::ContentTag::BgRgb => {
+                                let (r, g, b) = cell.bg_rgb();
+                                AnsiColor::Spec(crate::config::colors::ColorRgb {
+                                    r,
+                                    g,
+                                    b,
+                                })
+                            }
+                            _ => AnsiColor::Indexed(cell.bg_palette_index()),
+                        },
+                        ..Style::default()
+                    }
+                } else {
+                    self.grid.style_set.get(cell.style_id())
+                };
+'''
+          new = '''                let style = self.grid.style_of(cell);\n'''
+          if old not in text:
+              raise SystemExit("expected legacy style resolution block not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
           cargo check -p rioterm
+          git add rio-vt/src/crosswords/mod.rs
+          git commit -m "fix: adapt session serialization to upstream grid styles"
           git push origin HEAD:session-restore
