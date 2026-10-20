@@ -23,6 +23,7 @@ mod router;
 mod scheduler;
 mod screen;
 mod session;
+mod shell_integration;
 mod watcher;
 
 use clap::Parser;

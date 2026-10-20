@@ -2,9 +2,7 @@ pub mod renderable;
 pub mod title;
 
 use crate::ansi::CursorShape;
-use crate::context::title::{
-    create_title_extra_from_context, update_title, ContextTitle,
-};
+use crate::context::title::{update_title, ContextTitle};
 use crate::event::sync::FairMutex;
 use crate::event::{Msg, RioEvent};
 pub use crate::layout::{ContextDimension, ContextGrid, ContextGridItem};
@@ -26,7 +24,7 @@ use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // Global atomic counter for generating unique route IDs
 static ROUTE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -53,11 +51,21 @@ pub struct Context<T: EventListener> {
     pub main_fd: Arc<i32>,
     #[cfg(not(target_os = "windows"))]
     pub shell_pid: u32,
+    #[cfg(not(target_os = "windows"))]
+    child_terminator: teletypewriter::ChildTerminator,
     pub rich_text_id: usize,
     pub dimension: ContextDimension,
     pub title: ContextTitle,
     /// Program/arguments actually used to launch this pane.
     pub launch: Shell,
+    /// An OSC title change arrived while this pane was hidden: the
+    /// render was skipped and must run when the pane surfaces.
+    pub title_dirty: bool,
+    /// Display name of the command this pane spawned (the configured
+    /// shell or program), fixed for the pane's lifetime. Fills
+    /// `{{ program }}` and the empty-title strip fallback without ever
+    /// inspecting the foreground process.
+    pub spawned_program: String,
     _io_thread: Option<JoinHandle<(Machine<teletypewriter::Pty, T>, performer::State)>>,
 }
 
@@ -65,13 +73,12 @@ impl<T: rio_backend::event::EventListener> Drop for Context<T> {
     fn drop(&mut self) {
         // Shutdown the terminal's PTY.
         let _ = self.messenger.channel.send(Msg::Shutdown);
-
-        // `create_dead_context` uses 1 as a placeholder PID, so guard against
-        // signalling init (1) or our own process group (0).
+        // Also hang up synchronously: quit paths call process::exit
+        // right after dropping routes, before the reader thread can run
+        // its shutdown escalation. The handle is a no-op once the child
+        // was reaped, so no stale PID is ever signaled.
         #[cfg(not(target_os = "windows"))]
-        if self.shell_pid > 1 {
-            teletypewriter::kill_pid(self.shell_pid as i32);
-        }
+        let _ = self.child_terminator.hangup();
     }
 }
 
@@ -111,11 +118,11 @@ pub struct ContextManagerConfig {
     pub shell: Shell,
     #[cfg(not(target_os = "windows"))]
     pub use_fork: bool,
+    pub shell_integration: bool,
     pub working_dir: Option<String>,
     pub spawn_performer: bool,
     pub cwd: bool,
     pub is_native: bool,
-    pub should_update_title_extra: bool,
     pub split_color: [f32; 4],
     pub split_active_color: [f32; 4],
     pub panel: rio_backend::config::layout::Panel,
@@ -136,7 +143,29 @@ pub struct ContextManager<T: EventListener> {
     event_proxy: T,
     window_id: WindowId,
     pub config: ContextManagerConfig,
-    last_title_update: Option<Instant>,
+}
+
+/// Display name for the command a pane spawns: the configured program,
+/// else the user's shell (what the PTY spawn itself falls back to),
+/// reduced to its basename.
+fn spawned_program_name(config: &ContextManagerConfig) -> String {
+    let program = match config.shell.program.as_deref() {
+        Some(program) if !program.is_empty() => program.to_string(),
+        _ => {
+            #[cfg(unix)]
+            {
+                teletypewriter::default_shell_program()
+            }
+            #[cfg(not(unix))]
+            {
+                String::from("powershell")
+            }
+        }
+    };
+    std::path::Path::new(&program)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or(program)
 }
 
 pub fn create_dead_context<T: rio_backend::event::EventListener>(
@@ -164,6 +193,8 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
         main_fd: Arc::new(-1),
         #[cfg(not(target_os = "windows"))]
         shell_pid: 1,
+        #[cfg(not(target_os = "windows"))]
+        child_terminator: teletypewriter::ChildTerminator::retired(),
         messenger: Messenger::new(sender),
         renderable_content: RenderableContent::new(Cursor::default()),
         terminal,
@@ -171,6 +202,8 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
         dimension,
         title: ContextTitle::default(),
         launch: Shell::default(),
+        title_dirty: false,
+        spawned_program: String::new(),
         _io_thread: None,
     }
 }
@@ -287,14 +320,31 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
         let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
 
+        let integration = if config.shell_integration {
+            crate::shell_integration::prepare(
+                config.shell.program.as_deref(),
+                &config.shell.args,
+            )
+        } else {
+            crate::shell_integration::SpawnIntegration::default()
+        };
+        let (shell_program, shell_args) = match &integration.command {
+            Some((program, args)) => (program.as_deref(), args.as_slice()),
+            None => (
+                config.shell.program.as_deref(),
+                config.shell.args.as_slice(),
+            ),
+        };
+
         let pty;
         #[cfg(not(target_os = "windows"))]
         {
             if config.use_fork {
                 tracing::info!("rio -> teletypewriter: create_pty_with_fork");
                 pty = match create_pty_with_fork(
-                    config.shell.program.as_deref(),
-                    &config.shell.args,
+                    shell_program,
+                    shell_args,
+                    &integration.env,
                     cols,
                     rows,
                     initial_winsize.width,
@@ -309,10 +359,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             } else {
                 tracing::info!("rio -> teletypewriter: create_pty_with_spawn");
                 pty = match create_pty_with_spawn(
-                    config.shell.program.as_deref(),
-                    config.shell.args.clone(),
+                    shell_program,
+                    shell_args.to_vec(),
                     &config.working_dir,
-                    None,
+                    (!integration.env.is_empty()).then(|| integration.env.clone()),
                     cols,
                     rows,
                     initial_winsize.width,
@@ -331,14 +381,16 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         let main_fd = pty.child.id.clone();
         #[cfg(not(target_os = "windows"))]
         let shell_pid = *pty.child.pid.clone() as u32;
+        #[cfg(not(target_os = "windows"))]
+        let child_terminator = pty.child.terminator();
 
         #[cfg(target_os = "windows")]
         {
             pty = match create_pty(
-                config.shell.program.as_deref(),
-                config.shell.args.clone(),
+                shell_program,
+                shell_args.to_vec(),
                 &config.working_dir,
-                None,
+                (!integration.env.is_empty()).then(|| integration.env.clone()),
                 cols,
                 rows,
             ) {
@@ -366,12 +418,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
         let messenger = Messenger::new(channel);
 
-        Ok(Context {
+        let mut context = Context {
             route_id,
             #[cfg(not(target_os = "windows"))]
             main_fd,
             #[cfg(not(target_os = "windows"))]
             shell_pid,
+            #[cfg(not(target_os = "windows"))]
+            child_terminator,
             messenger,
             terminal,
             rich_text_id,
@@ -379,8 +433,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             dimension,
             title: ContextTitle::default(),
             launch: config.shell.clone(),
+            title_dirty: false,
+            spawned_program: spawned_program_name(config),
             _io_thread: io_thread,
-        })
+        };
+        context.title = ContextTitle {
+            content: update_title(&config.title.content, &context, None),
+        };
+        Ok(context)
     }
 
     #[inline]
@@ -443,7 +503,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             }
         }
 
-        Ok(ContextManager {
+        let mut manager = ContextManager {
             current_index: 0,
             current_route: 0,
             contexts: smallvec![ContextGrid::new(
@@ -457,8 +517,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             event_proxy,
             window_id,
             config: ctx_config,
-            last_title_update: None,
-        })
+        };
+        // The native titlebar starts as the placeholder; one poke makes
+        // it converge on the displayed title even for shells that never
+        // emit an OSC title or OSC 7.
+        manager.sync_window_title();
+        Ok(manager)
     }
 
     #[cfg(test)]
@@ -495,7 +559,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             event_proxy,
             window_id,
             config,
-            last_title_update: None,
         })
     }
 
@@ -512,11 +575,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         // tab (`tmux new -X` SIGHUPs a shell the user is not even
         // looking at), so the search covers every panel of every tab
         // rather than assuming the focused one.
-        let Some(tab_index) = self
-            .contexts
-            .iter_mut()
-            .position(|grid| grid.get_by_route_id(route_id).is_some())
-        else {
+        let Some(tab_index) = self.tab_index_for_route(route_id) else {
             return self.contexts.is_empty();
         };
 
@@ -526,7 +585,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if self.contexts[tab_index].len() > 1 {
             self.contexts[tab_index].remove_by_route(route_id, sugarloaf);
             if tab_index == self.current_index {
-                self.current_route = self.contexts[tab_index].current().route_id;
+                self.sync_current_route();
             }
             return false;
         }
@@ -627,19 +686,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn select_next_split(&mut self) {
         self.contexts[self.current_index].select_next_split();
-        self.current_route = self.current().route_id;
+        self.sync_current_route();
     }
 
     #[inline]
     pub fn select_prev_split(&mut self) {
         self.contexts[self.current_index].select_prev_split();
-        self.current_route = self.current().route_id;
+        self.sync_current_route();
     }
 
     #[inline]
     pub fn switch_to_next_split_or_tab(&mut self) {
         if self.contexts[self.current_index].select_next_split_no_loop() {
-            self.current_route = self.current().route_id;
+            self.sync_current_route();
             return;
         }
         self.switch_to_next();
@@ -648,13 +707,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if let Some(root) = current_tab.root {
             current_tab.current = root;
         }
-        self.current_route = self.current().route_id;
+        self.sync_current_route();
     }
 
     #[inline]
     pub fn switch_to_prev_split_or_tab(&mut self) {
         if self.contexts[self.current_index].select_prev_split_no_loop() {
-            self.current_route = self.current().route_id;
+            self.sync_current_route();
             return;
         }
         self.switch_to_prev();
@@ -664,7 +723,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if let Some(&last_key) = ordered_keys.last() {
             current_tab.current = last_key;
         }
-        self.current_route = self.current().route_id;
+        self.sync_current_route();
     }
 
     #[inline]
@@ -770,7 +829,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn select_route_from_current_grid(&mut self) {
-        self.current_route = self.current().route_id;
+        self.sync_current_route();
     }
 
     #[inline]
@@ -778,7 +837,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts.len()
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn title(&self, index: usize) -> Option<&ContextTitle> {
         self.contexts.get(index).map(|grid| &grid.current().title)
     }
@@ -791,9 +850,22 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
+    /// A rename changes what `displayed_title_for_tab` returns, so the
+    /// native titlebar gets the same convergence poke every other
+    /// displayed-title mutation sends.
     pub fn set_custom_title(&mut self, index: usize, title: Option<String>) {
         if let Some(grid) = self.contexts.get_mut(index) {
             grid.custom_title = title;
+        }
+        self.sync_window_title();
+    }
+
+    /// Drop every tab's bell mark, used when the indicator is disabled
+    /// by a live config reload: the ring-time gate stops new marks but
+    /// cannot retract ones already set.
+    pub fn clear_all_bells(&mut self) {
+        for grid in self.contexts.iter_mut() {
+            grid.bell = false;
         }
     }
 
@@ -809,6 +881,49 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
+    /// Index of the tab containing `route_id`'s pane. Per-route state
+    /// can live ANYWHERE (a background split of a background tab
+    /// included), so the search covers every panel of every tab.
+    #[inline]
+    pub fn tab_index_for_route(&mut self, route_id: usize) -> Option<usize> {
+        self.contexts
+            .iter_mut()
+            .position(|grid| grid.get_by_route_id(route_id).is_some())
+    }
+
+    /// A pane rang the bell. Flags its tab so the strip can surface it.
+    /// The current tab is skipped only while the window has focus: the
+    /// user is already looking at it then, but a ring in the visible
+    /// tab of an UNFOCUSED window would otherwise leave no trace at
+    /// all. Edge-triggered: a BEL flood marks once and repaints once.
+    #[inline]
+    pub fn ring_bell(&mut self, route_id: usize, window_focused: bool) -> bool {
+        let Some(tab_index) = self.tab_index_for_route(route_id) else {
+            return false;
+        };
+
+        if window_focused && tab_index == self.current_index {
+            return false;
+        }
+
+        !std::mem::replace(&mut self.contexts[tab_index].bell, true)
+    }
+
+    #[inline]
+    pub fn bell(&self, index: usize) -> bool {
+        self.contexts.get(index).is_some_and(|grid| grid.bell)
+    }
+
+    /// Clears the focused tab's bell flag. Called every FOCUSED frame so
+    /// the mark drops the moment the tab is shown to the user, whatever
+    /// brought it to the front; an unfocused window still renders on PTY
+    /// damage, and clearing there would wipe a mark nobody has seen yet.
+    #[inline]
+    pub fn clear_current_bell(&mut self) -> bool {
+        let grid = &mut self.contexts[self.current_index];
+        std::mem::replace(&mut grid.bell, false)
+    }
+
     #[inline]
     pub fn resize_all_grids(
         &mut self,
@@ -821,29 +936,135 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    pub fn update_titles(&mut self) {
-        let interval_time = Duration::from_secs(2);
-        if self
-            .last_title_update
-            .map(|i| i.elapsed() > interval_time)
-            .unwrap_or(true)
-        {
-            self.last_title_update = Some(Instant::now());
-            for grid in self.contexts.iter_mut() {
-                let content = update_title(&self.config.title.content, grid.current());
+    /// Re-render one pane's title. Returns whether the displayed text
+    /// changed (the empty-content fallback is the pane's static
+    /// spawned program, so displayed text changes exactly when the
+    /// content does).
+    fn refresh_item_title(
+        template: &str,
+        context: &mut Context<T>,
+        prefetched_title: Option<&str>,
+    ) -> bool {
+        let content = update_title(template, context, prefetched_title);
+        if content == context.title.content {
+            return false;
+        }
+        context.title = ContextTitle { content };
+        true
+    }
 
-                self.event_proxy
-                    .send_event(RioEvent::Title(content.to_owned()), self.window_id);
+    /// A pane's title data changed: an OSC 0/2 title (carried in
+    /// `raw_title`, so the common `{{ title }}` render never locks the
+    /// terminal) or an OSC 7 working directory (`raw_title` None: the
+    /// render re-reads the stored directory). A DISPLAYED pane (its
+    /// tab's current) re-renders immediately; a hidden pane is only
+    /// marked dirty (one flag write, no locks, no render) and renders
+    /// when it surfaces, so a background split streaming titles costs
+    /// nothing visible. One route scan serves every decision. Returns
+    /// whether the strip must repaint.
+    pub fn on_title_change(&mut self, route_id: usize, raw_title: Option<&str>) -> bool {
+        let Some(tab_index) = self.tab_index_for_route(route_id) else {
+            return false;
+        };
+        if self.contexts[tab_index].current().route_id != route_id {
+            if let Some(item) = self.contexts[tab_index].get_by_route_id(route_id) {
+                item.context_mut().title_dirty = true;
+            }
+            return false;
+        }
+        let template = self.config.title.content.clone();
+        let context = self.contexts[tab_index].current_mut();
+        context.title_dirty = false;
+        Self::refresh_item_title(&template, context, raw_title)
+    }
 
-                let extra = if self.config.should_update_title_extra {
-                    create_title_extra_from_context(grid.current())
-                } else {
-                    None
-                };
-
-                grid.current_mut().title = ContextTitle { content, extra };
+    /// Mark every pane's title stale. For changes that affect panes no
+    /// walk re-renders (a resize changing `{{columns}}`, a config
+    /// reload changing the template), hidden splits and unwalked tabs
+    /// re-render lazily when they surface via `sync_current_route`.
+    pub fn mark_all_titles_dirty(&mut self) {
+        for grid in self.contexts.iter_mut() {
+            for item in grid.contexts_mut().values_mut() {
+                item.context_mut().title_dirty = true;
             }
         }
+    }
+
+    /// Re-render tab titles from local state: a config reload can
+    /// change the template, and a resize changes `{{columns}}`/
+    /// `{{lines}}`. OSC title and OSC 7 changes arrive via
+    /// `on_title_change` instead; nothing calls this on a timer. The
+    /// chrome repaint rides the returned flag, and one unconditional
+    /// titlebar poke per run makes the native title CONVERGE on the
+    /// displayed text (the poke is payload-less and deduped at the
+    /// sink, so a run that changed nothing costs one no-op event).
+    /// `only_current` restricts the walk to the displayed tab: with
+    /// the tab strip absent (navigation disabled) background tabs'
+    /// titles render nowhere, so refreshing them buys nothing.
+    pub fn update_titles(&mut self, only_current: bool) -> bool {
+        let template = self.config.title.content.clone();
+        let mut repaint = false;
+        let range = if only_current {
+            self.current_index..self.current_index + 1
+        } else {
+            0..self.contexts.len()
+        };
+        for index in range {
+            let context = self.contexts[index].current_mut();
+            context.title_dirty = false;
+            repaint |= Self::refresh_item_title(&template, context, None);
+        }
+        self.sync_window_title();
+        repaint
+    }
+
+    /// The title the strip displays for `index`'s tab: the user rename,
+    /// else the rendered content, else the foreground program, else
+    /// "~". The native titlebar reads the same chain, so the two can
+    /// never disagree.
+    pub fn displayed_title_for_tab(&self, index: usize) -> String {
+        if let Some(custom) = self.custom_title(index) {
+            return custom.to_string();
+        }
+        if let Some(grid) = self.contexts.get(index) {
+            let context = grid.current();
+            if !context.title.content.is_empty() {
+                return context.title.content.clone();
+            }
+            if !context.spawned_program.is_empty() {
+                return context.spawned_program.clone();
+            }
+        }
+        String::from("~")
+    }
+
+    #[inline]
+    pub fn displayed_title_for_current_tab(&self) -> String {
+        self.displayed_title_for_tab(self.current_index)
+    }
+
+    /// Ask the event loop to refresh the native titlebar. Payload-less
+    /// on purpose: the handler re-reads the displayed title at handling
+    /// time, so a queued poke can never overwrite a newer title with a
+    /// stale snapshot, and redundant pokes dedupe at the sink.
+    fn sync_window_title(&mut self) {
+        self.event_proxy
+            .send_event(RioEvent::SyncWindowTitle, self.window_id);
+    }
+
+    /// Point `current_route` at the pane the user now sees and poke the
+    /// titlebar. Every displayed-pane change (tab switch, split
+    /// selection, split death, new splits) funnels here so the titlebar
+    /// can never be left showing a pane that is not on screen.
+    fn sync_current_route(&mut self) {
+        self.current_route = self.current().route_id;
+        if self.current().title_dirty {
+            let template = self.config.title.content.clone();
+            let context = self.contexts[self.current_index].current_mut();
+            context.title_dirty = false;
+            Self::refresh_item_title(&template, context, None);
+        }
+        self.sync_window_title();
     }
 
     #[inline]
@@ -881,7 +1102,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn remove_current_grid(&mut self, sugarloaf: &mut Sugarloaf) {
         self.contexts[self.current_index].remove_current(sugarloaf);
-        self.current_route = self.contexts[self.current_index].current().route_id;
+        self.sync_current_route();
     }
 
     #[inline]
@@ -1043,7 +1264,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn set_current(&mut self, context_id: usize) {
         if context_id < self.contexts.len() {
             self.current_index = context_id;
-            self.current_route = self.current().route_id;
+            self.sync_current_route();
         }
     }
 
@@ -1113,7 +1334,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.current_index += 1;
         }
 
-        self.current_route = self.current().route_id;
+        self.sync_current_route();
     }
 
     #[inline]
@@ -1130,7 +1351,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.current_index -= 1;
         }
 
-        self.current_route = self.current().route_id;
+        self.sync_current_route();
     }
 
     #[inline]
@@ -1228,6 +1449,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 }
 
                 self.current_route = new_route_id;
+                self.sync_window_title();
             }
             Err(..) => {
                 tracing::error!("not able to create a new context");
@@ -1258,10 +1480,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             spawn_performer: true,
             #[cfg(not(target_os = "windows"))]
             use_fork: config.use_fork,
+            shell_integration: config.shell_integration,
             is_native: config.navigation.is_native(),
             // When navigation is collapsed and does not contain any color rule
             // does not make sense fetch for foreground process names
-            should_update_title_extra: !config.navigation.color_automation.is_empty(),
             split_color: config.colors.split,
             split_active_color: config.colors.split_active,
             panel: config.panel,
@@ -1291,6 +1513,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 }
 
                 self.current_route = new_route_id;
+                self.sync_window_title();
             }
             Err(..) => {
                 tracing::error!("not able to create a new context");
@@ -1366,7 +1589,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     ));
                     if redirect {
                         self.current_index = last_index;
-                        self.current_route = self.current().route_id;
+                        self.sync_current_route();
                     }
                 }
                 Err(..) => {
@@ -1537,6 +1760,89 @@ pub mod test {
 
         context_manager.set_current(8);
         assert_eq!(context_manager.current_index, 3);
+    }
+
+    #[test]
+    fn bell_marks_background_tabs_only_and_clears_on_focus() {
+        let mut cm =
+            ContextManager::start_with_capacity(5, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        cm.add_context(true, 0);
+        cm.add_context(true, 0);
+        cm.set_current(0);
+
+        let background_route = cm.contexts[2].current().route_id;
+        let focused_route = cm.contexts[0].current().route_id;
+
+        assert!(cm.ring_bell(background_route, true));
+        assert!(cm.bell(2));
+
+        assert!(!cm.ring_bell(background_route, true));
+        assert!(cm.bell(2));
+
+        assert!(!cm.ring_bell(focused_route, true));
+        assert!(!cm.bell(0));
+
+        assert!(cm.ring_bell(focused_route, false));
+        assert!(cm.bell(0));
+        cm.contexts[0].bell = false;
+
+        // Unknown routes (already-closed panes) are a no-op.
+        assert!(!cm.ring_bell(usize::MAX, true));
+
+        // Focusing the tab drops the mark on the next rendered frame.
+        cm.set_current(2);
+        assert!(cm.bell(2));
+        assert!(cm.clear_current_bell());
+        assert!(!cm.bell(2));
+    }
+
+    #[test]
+    fn update_titles_only_current_leaves_other_tabs_dirty() {
+        let mut cm =
+            ContextManager::start_with_capacity(5, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        cm.add_context(false, 0);
+        cm.config.title.content = "{{ columns }}".to_string();
+
+        cm.mark_all_titles_dirty();
+        assert!(cm.contexts[0].current().title_dirty);
+        assert!(cm.contexts[1].current().title_dirty);
+
+        // A current-only walk (tab strip absent) must not silently
+        // clear panes it never re-rendered.
+        assert!(cm.update_titles(true));
+        assert!(!cm.contexts[0].current().title_dirty);
+        assert!(cm.contexts[1].current().title_dirty);
+        let columns = cm.contexts[0].current().dimension.columns.to_string();
+        assert_eq!(cm.contexts[0].current().title.content, columns);
+
+        // Surfacing the stale tab re-renders it via sync_current_route.
+        cm.set_current(1);
+        assert!(!cm.contexts[1].current().title_dirty);
+        let columns = cm.contexts[1].current().dimension.columns.to_string();
+        assert_eq!(cm.contexts[1].current().title.content, columns);
+    }
+
+    #[test]
+    fn on_title_change_renders_displayed_pane_from_event_string() {
+        let mut cm =
+            ContextManager::start_with_capacity(5, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        cm.add_context(false, 0);
+        cm.config.title.content = "{{ title }}".to_string();
+
+        let background_route = cm.contexts[1].current().route_id;
+        cm.contexts[1].current_mut().title_dirty = true;
+        assert!(cm.on_title_change(background_route, Some("hello")));
+        assert_eq!(cm.contexts[1].current().title.content, "hello");
+        assert!(!cm.contexts[1].current().title_dirty);
+
+        // The same title again changes nothing: no repaint requested.
+        assert!(!cm.on_title_change(background_route, Some("hello")));
+
+        // Unknown routes (already-closed panes) are a no-op.
+        assert!(!cm.on_title_change(usize::MAX, Some("x")));
     }
 
     fn set_tab_title(cm: &mut ContextManager<VoidListener>, index: usize, content: &str) {
