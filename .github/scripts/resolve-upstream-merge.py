@@ -42,7 +42,7 @@ def resolve(path: str, expected_count: int) -> None:
             if "session_name: " in ours and "quit_requested:" in theirs:
                 return ours + theirs
         elif path.endswith("/handler.rs"):
-            if "parse_osc9_9_current_directory" in ours and "parse_conemu_working_directory" in theirs:
+            if "parse_osc9_9_current_directory" in ours and 'b"9" => match params.get(1).copied()' in theirs:
                 # Official parser accepts Nushell/ConEmu OSC 9;9 reports,
                 # absolute Windows and Unix paths, semicolon payloads,
                 # while also consuming malformed OSC 9;4 / 9;9 reports.
