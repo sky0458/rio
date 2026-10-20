@@ -1,0 +1,37 @@
+name: Upstream Merge Probe
+on:
+  push:
+    branches:
+      - merge-upstream-20261020
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: merge-upstream-20261020
+          fetch-depth: 0
+      - name: Inspect merge conflicts
+        shell: bash
+        run: |
+          set -u
+          git config user.name 'upstream-probe'
+          git config user.email 'probe@localhost'
+          git fetch origin sync-upstream-20261020
+          echo '=== CURRENT SHA ==='
+          git rev-parse HEAD
+          echo '=== OFFICIAL SHA ==='
+          git rev-parse FETCH_HEAD
+          git merge --no-commit --no-ff FETCH_HEAD || true
+          echo '=== CONFLICT FILES ==='
+          git diff --name-only --diff-filter=U
+          echo '=== STATUS ==='
+          git status --short
+          echo '=== CONFLICT HUNKS ==='
+          git diff --cc | head -n 950 || true
+          echo '=== END ==='
