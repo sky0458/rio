@@ -31,6 +31,10 @@ jobs:
           git diff --cached --check
       - name: Rust formatting
         run: cargo fmt --all -- --check
+      - name: Install Linux font libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev
       - name: Compile Rio frontend
         run: cargo check -p rioterm
       - name: Test terminal escape parsing
