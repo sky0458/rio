@@ -26,8 +26,8 @@ jobs:
           git fetch origin sync-upstream-20261020
           git merge --no-commit --no-ff FETCH_HEAD || true
           python3 .github/scripts/resolve-upstream-merge.py
-          test -z "$(git diff --name-only --diff-filter=U)"
           git add -A
+          test -z "$(git diff --cached --name-only --diff-filter=U)"
           git diff --cached --check
       - name: Rust formatting
         run: cargo fmt --all -- --check
