@@ -34,7 +34,7 @@ jobs:
       - name: Install Linux font libraries
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev glslang-tools
       - name: Compile Rio frontend
         run: cargo check -p rioterm
       - name: Test terminal escape parsing
